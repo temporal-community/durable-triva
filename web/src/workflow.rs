@@ -37,6 +37,13 @@ pub struct GameWorkflow {
     attempts_seen: BTreeSet<String>,
     questions: BTreeMap<String, Question>,
     index_search_attributes: bool,
+    /// Workflow time as of the last `expire_chaos` sweep.
+    ///
+    /// `WorkflowContextView` deliberately exposes no clock — an Update
+    /// validator has to be a pure function of state and input — so this is
+    /// the freshest time `validate_apply_chaos` can reason about. Derived
+    /// from the run loop's deterministic `workflow_time`, so it replays.
+    last_chaos_sweep_unix_ms: u64,
 }
 
 pub type GameWorkflowRun = <GameWorkflow as temporalio_common::HasWorkflowDefinition>::Run;
@@ -99,7 +106,10 @@ impl GameWorkflow {
 
         loop {
             let now_unix_ms = workflow_unix_ms(ctx);
-            ctx.state_mut(|state| expire_chaos(&mut state.snapshot, now_unix_ms));
+            ctx.state_mut(|state| {
+                expire_chaos(&mut state.snapshot, now_unix_ms);
+                state.last_chaos_sweep_unix_ms = now_unix_ms;
+            });
             let deadline_unix_ms = ctx
                 .state(|state| state.snapshot.deadline_unix_ms)
                 .unwrap_or(now_unix_ms);
@@ -335,7 +345,7 @@ impl GameWorkflow {
                 Ok(())
             };
         }
-        if let Some(active) = active_modifier(&self.snapshot) {
+        if let Some(active) = active_modifier(&self.snapshot, self.last_chaos_sweep_unix_ms) {
             return Err(
                 format!("{active} is already active; gameplay modifiers cannot overlap").into(),
             );
@@ -502,10 +512,24 @@ fn is_reassignment(previous: &BadgeEvent, current: &BadgeEvent) -> bool {
     previous.badge_id != current.badge_id && current.attempt > previous.attempt
 }
 
-fn active_modifier(snapshot: &GameSnapshot) -> Option<&'static str> {
-    if snapshot.chaos.double_points_until_unix_ms.is_some() {
+/// The gameplay modifier in force at `now_unix_ms`, if any.
+///
+/// Takes the clock rather than trusting `expire_chaos` to have run. That
+/// sweep happens once per loop tick, so between a modifier expiring and the
+/// next tick the fields are still populated — and this is what
+/// `validate_apply_chaos` rejects an operator's powerup on.
+fn active_modifier(snapshot: &GameSnapshot, now_unix_ms: u64) -> Option<&'static str> {
+    if snapshot
+        .chaos
+        .double_points_until_unix_ms
+        .is_some_and(|until| until > now_unix_ms)
+    {
         Some("double points")
-    } else if snapshot.chaos.rust_only_until_unix_ms.is_some() {
+    } else if snapshot
+        .chaos
+        .rust_only_until_unix_ms
+        .is_some_and(|until| until > now_unix_ms)
+    {
         Some("Rust only")
     } else if snapshot.chaos.sudden_death {
         Some("sudden death")
@@ -630,11 +654,11 @@ mod tests {
     fn gameplay_modifiers_are_mutually_exclusive_but_extension_is_independent() {
         let mut snapshot = GameSnapshot::default();
         snapshot.chaos.rust_only_until_unix_ms = Some(20_000);
-        assert_eq!(active_modifier(&snapshot), Some("Rust only"));
+        assert_eq!(active_modifier(&snapshot, 19_999), Some("Rust only"));
         expire_chaos(&mut snapshot, 20_000);
-        assert_eq!(active_modifier(&snapshot), None);
+        assert_eq!(active_modifier(&snapshot, 20_000), None);
         snapshot.chaos.extension_used = true;
-        assert_eq!(active_modifier(&snapshot), None);
+        assert_eq!(active_modifier(&snapshot, 20_000), None);
     }
 
     #[test]
@@ -678,7 +702,7 @@ mod tests {
 
         // So the validator must not still call the round modified.
         assert_eq!(
-            active_modifier(&snapshot),
+            active_modifier(&snapshot, now_unix_ms),
             None,
             "double points expired at 1000, it is now {now_unix_ms}"
         );
