@@ -2,16 +2,16 @@ mod model;
 mod questions;
 mod workflow;
 
+use temporal_trivia_web::cloud;
+
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     convert::Infallible,
-    path::{Path, PathBuf},
-    str::FromStr,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow};
 use axum::{
     Json, Router,
     extract::{Path as AxumPath, State},
@@ -23,9 +23,9 @@ use futures::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use temporalio_client::{
-    Client, ClientOptions, Connection, ConnectionOptions, NamespacedClient, TlsOptions,
-    WorkflowDescribeOptions, WorkflowExecuteUpdateOptions, WorkflowExecution, WorkflowHandle,
-    WorkflowListOptions, WorkflowQueryOptions, WorkflowStartOptions, tonic::Request,
+    Client, NamespacedClient, WorkflowDescribeOptions, WorkflowExecuteUpdateOptions,
+    WorkflowExecution, WorkflowHandle, WorkflowListOptions, WorkflowQueryOptions,
+    WorkflowStartOptions, tonic::Request,
 };
 use temporalio_common::protos::temporal::api::enums::v1::{
     TaskQueueType, WorkflowIdConflictPolicy, WorkflowIdReusePolicy,
@@ -35,7 +35,6 @@ use temporalio_common::protos::temporal::api::{
 };
 use temporalio_common::telemetry::TelemetryOptions;
 use temporalio_sdk::{Runtime, Worker, WorkerOptions, runtime::RuntimeOptions};
-use temporalio_sdk_core::Url;
 use tokio::sync::{Mutex, RwLock, broadcast};
 use tokio_stream::wrappers::BroadcastStream;
 use uuid::Uuid;
@@ -631,70 +630,8 @@ async fn publish(state: &AppState, snapshot: GameSnapshot) {
 }
 
 async fn connect_cloud() -> Result<Client> {
-    let settings = read_cloud_settings()?;
-    let address = required(&settings, "TEMPORAL_ADDRESS")?;
-    let target = if address.contains("://") {
-        address.to_owned()
-    } else {
-        format!("https://{address}")
-    };
-    let options = ConnectionOptions::new(Url::from_str(&target)?)
-        .api_key(required(&settings, "TEMPORAL_API_KEY")?)
-        .tls_options(TlsOptions::default())
-        .build();
-    let connection = Connection::connect(options).await?;
-    Client::new(
-        connection,
-        ClientOptions::new(required(&settings, "TEMPORAL_NAMESPACE")?).build(),
-    )
-    .map_err(Into::into)
-}
-
-fn read_cloud_settings() -> Result<HashMap<String, String>> {
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let project = manifest.parent().context("locate repository root")?;
-    let repo_env = project.join(".env");
-    let local_path = if repo_env.is_file() {
-        repo_env
-    } else {
-        project.join(".env.temporal")
-    };
-    let legacy_path = project
-        .parent()
-        .and_then(Path::parent)
-        .map(|root| root.join("TrafficLight/.env"));
-    let path = std::env::var_os("TEMPORAL_ENV_FILE")
-        .map(PathBuf::from)
-        .or_else(|| local_path.is_file().then_some(local_path.clone()))
-        .unwrap_or_else(|| legacy_path.unwrap_or(local_path));
-    let mut settings = if path.is_file() {
-        parse_env_file(&path)?
-    } else {
-        HashMap::new()
-    };
-    for key in ["TEMPORAL_ADDRESS", "TEMPORAL_NAMESPACE", "TEMPORAL_API_KEY"] {
-        if let Ok(value) = std::env::var(key)
-            && !value.is_empty()
-        {
-            settings.insert(key.to_owned(), value);
-        }
-    }
-    Ok(settings)
-}
-
-fn parse_env_file(path: &Path) -> Result<HashMap<String, String>> {
-    let content = std::fs::read_to_string(path)
-        .with_context(|| format!("read Temporal settings from {}", path.display()))?;
-    temporal_trivia_shared::parse_env(&content)
-        .with_context(|| format!("parse Temporal settings from {}", path.display()))
-}
-
-fn required<'a>(settings: &'a HashMap<String, String>, name: &str) -> Result<&'a str> {
-    let value = settings.get(name).map(String::as_str).unwrap_or("");
-    if value.is_empty() {
-        bail!("missing {name}; set it in the environment or .env.temporal");
-    }
-    Ok(value)
+    let profile = cloud::load_profile()?;
+    cloud::connect(&profile).await
 }
 
 #[cfg(test)]
