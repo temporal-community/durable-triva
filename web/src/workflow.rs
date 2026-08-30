@@ -219,11 +219,20 @@ impl GameWorkflow {
         drop(pending);
         ctx.state_mut(|state| state.snapshot.finish());
         let round_memo = ctx.state(|state| RoundMemo::from(&state.snapshot));
-        ctx.upsert_memo([(
+        // A memo is a reporting convenience. Panicking here fails the Workflow
+        // Task, which Temporal then retries forever on a round that has already
+        // played out -- losing the result to protect a summary field.
+        if let Err(error) = ctx.upsert_memo([(
             "TriviaRoundSummary".to_owned(),
             Some(MemoValue::new(round_memo)),
-        )])
-        .expect("round summary memo update");
+        )]) {
+            ctx.state_mut(|state| {
+                state.snapshot.push_kind(
+                    EventKind::Fault,
+                    format!("Round summary memo was not recorded: {error}"),
+                );
+            });
+        }
         if input.index_search_attributes {
             upsert_finished_search_attributes(ctx);
         }
