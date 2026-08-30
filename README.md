@@ -82,15 +82,24 @@ configuration.
 
 ## Common checks
 
-Run formatting and whitespace checks from the repository root:
+Run the host-side checks -- fmt, clippy and the full test suite for `web`,
+`shared` and `badge-screen` -- from the repository root:
 
 ```sh
-cargo fmt --all -- --check
+./check-host.sh
 git diff --check
 ```
 
-Component-specific build, test, and hardware verification commands live in the
-[firmware guide](firmware/README.md) and [web guide](web/README.md).
+**Use the script rather than a bare `cargo test`.** `.cargo/config.toml` pins
+`build.target` to `xtensa-esp32s3-espidf` so the firmware builds without extra
+flags, which means a plain `cargo test` or `cargo clippy` from the root tries
+to build the host crates for the badge and fails. `check-host.sh` supplies the
+host target and the stable toolchain explicitly. Extra arguments are passed
+through to `cargo test`, so `./check-host.sh winner` filters as usual.
+
+Firmware build and hardware verification live in `./build-firmware.sh`.
+Component-specific commands are in the [firmware guide](firmware/README.md)
+and [web guide](web/README.md).
 
 ## Simulate badges on a Mac
 
