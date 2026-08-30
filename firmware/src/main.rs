@@ -426,10 +426,11 @@ impl BadgeActivities {
             .result_watcher
             .lock()
             .map_err(|_| anyhow!("watcher lock poisoned"))?;
-        if let Some(current) = watcher.as_ref() {
-            if current.game_id == task.game_id && !current.task.is_finished() {
-                return Ok(());
-            }
+        if let Some(current) = watcher.as_ref()
+            && current.game_id == task.game_id
+            && !current.task.is_finished()
+        {
+            return Ok(());
         }
         if let Some(previous) = watcher.take() {
             previous.task.abort();
@@ -449,12 +450,11 @@ impl BadgeActivities {
                 {
                     Ok(snapshot) if snapshot.status == model::GameStatus::Finished => {
                         let won = snapshot.winners.contains(&identity.callsign);
-                        if let Ok(mut screen) = display.lock() {
-                            if let Err(error) =
+                        if let Ok(mut screen) = display.lock()
+                            && let Err(error) =
                                 screen.show_results(&identity.callsign, &identity.id, &snapshot)
-                            {
-                                log::error!("show final results: {error:#}");
-                            }
+                        {
+                            log::error!("show final results: {error:#}");
                         }
                         haptics::play(
                             &haptics,
@@ -651,49 +651,62 @@ async fn monitor_powerups(
     let handle = client.get_workflow_handle::<GameWorkflowRun>(ACTIVE_WORKFLOW_ID);
     let mut game_id = None;
     let mut sequence = 0;
+    let mut consecutive_errors = 0_u32;
     loop {
-        if let Ok(snapshot) = handle
+        match handle
             .query(GameWorkflow::snapshot, (), WorkflowQueryOptions::default())
             .await
         {
-            let doubled = snapshot
-                .chaos
-                .double_points_until_unix_ms
-                .is_some_and(|until| until > unix_ms());
-            point_value.store(if doubled { 2 } else { 1 }, Ordering::Release);
-            if snapshot.game_id != game_id {
-                game_id.clone_from(&snapshot.game_id);
-                sequence = 0;
+            Err(error) => {
+                consecutive_errors = consecutive_errors.saturating_add(1);
+                // Every 120th is once a minute at the 500 ms poll interval.
+                // Silence here is what made a badge that had lost Temporal
+                // look identical to one with no power-ups to show.
+                if consecutive_errors == 1 || consecutive_errors.is_multiple_of(120) {
+                    log::warn!("power-up poll has failed {consecutive_errors} time(s): {error}");
+                }
             }
-            if let Some(notice) = snapshot.chaos.latest_powerup
-                && notice.sequence > sequence
-            {
-                sequence = notice.sequence;
-                if snapshot.status == model::GameStatus::Running
-                    && unix_ms().saturating_sub(notice.issued_unix_ms) <= POWERUP_FRESHNESS_MS
+            Ok(snapshot) => {
+                consecutive_errors = 0;
+                let doubled = snapshot
+                    .chaos
+                    .double_points_until_unix_ms
+                    .is_some_and(|until| until > unix_ms());
+                point_value.store(if doubled { 2 } else { 1 }, Ordering::Release);
+                if snapshot.game_id != game_id {
+                    game_id.clone_from(&snapshot.game_id);
+                    sequence = 0;
+                }
+                if let Some(notice) = snapshot.chaos.latest_powerup
+                    && notice.sequence > sequence
                 {
-                    let _overlay = PowerupActiveGuard::new(Arc::clone(&powerup_active));
-                    if let Ok(mut screen) = display.lock() {
-                        match screen.show_powerup(&callsign, notice.command) {
-                            Ok(()) => log::info!(
-                                "Displayed Temporal power-up {:?} sequence {}",
-                                notice.command,
-                                notice.sequence
-                            ),
-                            Err(error) => log::error!("show power-up: {error:#}"),
+                    sequence = notice.sequence;
+                    if snapshot.status == model::GameStatus::Running
+                        && unix_ms().saturating_sub(notice.issued_unix_ms) <= POWERUP_FRESHNESS_MS
+                    {
+                        let _overlay = PowerupActiveGuard::new(Arc::clone(&powerup_active));
+                        if let Ok(mut screen) = display.lock() {
+                            match screen.show_powerup(&callsign, notice.command) {
+                                Ok(()) => log::info!(
+                                    "Displayed Temporal power-up {:?} sequence {}",
+                                    notice.command,
+                                    notice.sequence
+                                ),
+                                Err(error) => log::error!("show power-up: {error:#}"),
+                            }
                         }
-                    }
-                    haptics::play(&haptics, HapticEvent::Powerup).await;
-                    tokio::time::sleep(POWERUP_OVERLAY).await;
-                    let question = current_question.lock().ok().and_then(|task| task.clone());
-                    if let Ok(mut screen) = display.lock() {
-                        let result = if let Some(task) = question {
-                            screen.show_question(&callsign, &task.question)
-                        } else {
-                            screen.show_waiting(&callsign)
-                        };
-                        if let Err(error) = result {
-                            log::error!("restore screen after power-up: {error:#}");
+                        haptics::play(&haptics, HapticEvent::Powerup).await;
+                        tokio::time::sleep(POWERUP_OVERLAY).await;
+                        let question = current_question.lock().ok().and_then(|task| task.clone());
+                        if let Ok(mut screen) = display.lock() {
+                            let result = if let Some(task) = question {
+                                screen.show_question(&callsign, &task.question)
+                            } else {
+                                screen.show_waiting(&callsign)
+                            };
+                            if let Err(error) = result {
+                                log::error!("restore screen after power-up: {error:#}");
+                            }
                         }
                     }
                 }

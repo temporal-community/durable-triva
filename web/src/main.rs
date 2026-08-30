@@ -67,6 +67,14 @@ const WORKFLOW_MAX_ERROR_BACKOFF: Duration = Duration::from_secs(4);
 const MAX_BACKLOG_OVERRIDE: usize = 100;
 const ROUND_HISTORY_LIMIT: usize = 12;
 const ROUND_HISTORY_SCAN_LIMIT: usize = 100;
+/// Questions dealt to a round.
+///
+/// The whole deck travels in `GameInput` and lands in
+/// `WorkflowExecutionStarted`, where it stays for the life of the execution.
+/// Ten badges over the 90 second ceiling get through roughly 200 -- a badge
+/// needs a few seconds to read and press -- so 500 put about 70 KB of undealt
+/// questions into every History.
+const DECK_SIZE: usize = 150;
 const ACTIVE_BADGE_POLLER_MAX_AGE: Duration = Duration::from_secs(60);
 
 #[derive(Clone)]
@@ -316,7 +324,7 @@ async fn start_game(
     let target_backlog = request
         .backlog_override
         .unwrap_or_else(|| recovery_capacity(detected_badge_count));
-    let deck = questions::build_deck(rand::random(), 500)
+    let deck = questions::build_deck(rand::random(), DECK_SIZE)
         .map_err(|error| ApiError(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let game_id = format!("trivia-{}", Uuid::new_v4().simple());
     {
@@ -511,7 +519,7 @@ async fn crash_worker() -> Result<Json<serde_json::Value>, ApiError> {
 
 async fn round_history(State(state): State<AppState>) -> Result<Json<Vec<RoundSummary>>, ApiError> {
     let stream = state.client.list_workflows(
-        "WorkflowId = 'temporal-trivia-active' AND ExecutionStatus = 'Completed'",
+        format!("WorkflowId = '{ACTIVE_WORKFLOW_ID}' AND ExecutionStatus = 'Completed'"),
         WorkflowListOptions::builder()
             .limit(ROUND_HISTORY_SCAN_LIMIT)
             .build(),

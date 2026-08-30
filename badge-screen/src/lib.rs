@@ -4,6 +4,8 @@
 //! I2C transport and nothing else, so every screen the badge can draw is unit
 //! testable and previewable from a development host.
 
+use std::fmt;
+
 use temporal_trivia_shared::{ChaosCommand, GameSnapshot, Question};
 
 pub const WIDTH: usize = 128;
@@ -87,9 +89,25 @@ impl Status {
 }
 
 /// A 1-bit 128x64 framebuffer laid out the way the SSD1306 expects it.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Canvas {
     buffer: [u8; BUFFER_LEN],
+}
+
+/// Reports the shape and how much of it is lit, not the buffer.
+///
+/// A derived `Debug` would print all 1024 bytes into every failing
+/// `assert_eq!`, which buries the assertion that failed.
+impl fmt::Debug for Canvas {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let lit: u32 = self.buffer.iter().map(|byte| byte.count_ones()).sum();
+        formatter
+            .debug_struct("Canvas")
+            .field("width", &WIDTH)
+            .field("height", &HEIGHT)
+            .field("lit_pixels", &lit)
+            .finish()
+    }
 }
 
 impl Default for Canvas {
