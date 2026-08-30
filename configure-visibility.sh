@@ -2,14 +2,18 @@
 set -eu
 
 project_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-settings="$project_dir/.env"
-if [ ! -f "$settings" ]; then
-    settings="$project_dir/.env.temporal"
+if [ -n "${TEMPORAL_ENV_FILE:-}" ]; then
+    if [ ! -f "$TEMPORAL_ENV_FILE" ]; then
+        echo "TEMPORAL_ENV_FILE points to missing file $TEMPORAL_ENV_FILE" >&2
+        exit 1
+    fi
+    settings="$TEMPORAL_ENV_FILE"
+else
+    settings="$project_dir/.env"
+    if [ ! -f "$settings" ]; then
+        settings="$project_dir/.env.temporal"
+    fi
 fi
-if [ ! -f "$settings" ] && [ -f "$project_dir/../../TrafficLight/.env" ]; then
-    settings="$project_dir/../../TrafficLight/.env"
-fi
-
 if [ -f "$settings" ]; then
     set -a
     # shellcheck disable=SC1090
