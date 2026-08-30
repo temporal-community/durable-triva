@@ -66,6 +66,10 @@ const POWERUP_FRESHNESS_MS: u64 = 5_000;
 const FEEDBACK_HOLD: Duration = Duration::from_millis(1_100);
 const GAME_SIGNAL_TIMEOUT: Duration = Duration::from_millis(750);
 const ACTIVE_WORKFLOW_ID: &str = "temporal-trivia-active";
+/// How long a badge waits past the deadline for the Workflow to publish the
+/// final standings before it gives up and shows RESULT PENDING.
+const RESULT_WATCH_INTERVAL: Duration = Duration::from_secs(1);
+const RESULT_WATCH_POLLS: u32 = 45;
 
 type SharedDisplay = Arc<Mutex<BadgeDisplay>>;
 type SharedInput = Arc<Mutex<BadgeInput>>;
@@ -443,7 +447,7 @@ impl BadgeActivities {
         let task = tokio::spawn(async move {
             let wait_ms = deadline_unix_ms.saturating_sub(unix_ms());
             tokio::time::sleep(Duration::from_millis(wait_ms)).await;
-            for _ in 0..45 {
+            for _ in 0..RESULT_WATCH_POLLS {
                 match handle
                     .query(GameWorkflow::snapshot, (), WorkflowQueryOptions::default())
                     .await
@@ -470,7 +474,7 @@ impl BadgeActivities {
                     Ok(_) => {}
                     Err(error) => log::warn!("result query pending: {error}"),
                 }
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                tokio::time::sleep(RESULT_WATCH_INTERVAL).await;
             }
             if let Ok(mut screen) = display.lock() {
                 let _ = screen.show_status(&identity.callsign, Status::ResultPending);

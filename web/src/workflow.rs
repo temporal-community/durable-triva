@@ -458,7 +458,9 @@ fn record_answer(
     now_unix_ms: u64,
 ) -> bool {
     ctx.state_mut(|state| {
-        if answer.question_id != question.id || answer.selected_index > 3 {
+        if answer.question_id != question.id
+            || usize::from(answer.selected_index) >= question.answers.len()
+        {
             state.snapshot.push_kind(
                 EventKind::Fault,
                 format!("Rejected malformed answer from {}", answer.callsign),
@@ -489,7 +491,14 @@ fn record_answer(
         state.snapshot.completed_questions += 1;
         state.snapshot.latest_answer = Some(AnswerSpotlight {
             question: question.prompt,
-            correct_answer: question.answers[question.correct_index as usize].clone(),
+            // correct_index is validated at the serde boundary, but this is
+            // the only place it indexes, and a panic here would fail the
+            // Workflow Task on a round that has already been answered.
+            correct_answer: question
+                .answers
+                .get(usize::from(question.correct_index))
+                .cloned()
+                .unwrap_or_default(),
             callsign: answer.callsign.clone(),
             was_correct,
             score,
@@ -765,6 +774,21 @@ mod tests {
             snapshot.chaos.rust_only_until_unix_ms, None,
             "expiry is inclusive of the boundary"
         );
+    }
+
+    #[test]
+    fn an_out_of_range_answer_index_is_rejected_not_indexed() {
+        let question = question("q-1", "rust");
+        // The wire type validates this at the serde boundary, so an
+        // out-of-range index can only arrive from a replayed History or a
+        // hand-crafted payload -- exactly when a panic would be worst.
+        for index in [4_u8, 200, u8::MAX] {
+            assert!(
+                usize::from(index) >= question.answers.len(),
+                "index {index} must be treated as malformed"
+            );
+        }
+        assert!(usize::from(3_u8) < question.answers.len());
     }
 
     #[test]

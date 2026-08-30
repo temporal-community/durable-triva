@@ -151,11 +151,12 @@ border:1px solid #1d2a24;border-radius:3px}\
 </style>",
     );
     for (label, canvas) in screens() {
-        let _ = write!(
+        write!(
             html,
             "<figure><figcaption>{label}</figcaption>{}</figure>",
             render(&canvas)
-        );
+        )
+        .expect("writing to a String cannot fail");
     }
     println!("{html}");
 }
