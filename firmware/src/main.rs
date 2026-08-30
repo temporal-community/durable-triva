@@ -727,18 +727,30 @@ fn unix_ms() -> u64 {
         .as_millis() as u64
 }
 
-fn show_status(display: &SharedDisplay, title: &str, status: Status) -> Result<()> {
-    display
+/// Runs one drawing call against the shared display.
+///
+/// Six wrappers below each repeated the same lock-and-translate preamble; the
+/// only thing that varied was which `BadgeDisplay` method ran. They keep their
+/// own names because the call sites read better as `show_panic(...)` than as a
+/// closure, but the poisoned-lock handling now exists once.
+fn with_display<T>(
+    display: &SharedDisplay,
+    draw: impl FnOnce(&mut BadgeDisplay) -> Result<T>,
+) -> Result<T> {
+    let mut screen = display
         .lock()
-        .map_err(|_| anyhow!("display lock poisoned"))?
-        .show_status(title, status)
+        .map_err(|_| anyhow!("display lock poisoned"))?;
+    draw(&mut screen)
+}
+
+fn show_status(display: &SharedDisplay, title: &str, status: Status) -> Result<()> {
+    with_display(display, |screen| screen.show_status(title, status))
 }
 
 fn show_question(display: &SharedDisplay, callsign: &str, task: &QuestionTask) -> Result<()> {
-    display
-        .lock()
-        .map_err(|_| anyhow!("display lock poisoned"))?
-        .show_question(callsign, &task.question)
+    with_display(display, |screen| {
+        screen.show_question(callsign, &task.question)
+    })
 }
 
 fn show_feedback(
@@ -747,31 +759,21 @@ fn show_feedback(
     correct: bool,
     score_delta: i32,
 ) -> Result<()> {
-    display
-        .lock()
-        .map_err(|_| anyhow!("display lock poisoned"))?
-        .show_feedback(callsign, correct, score_delta)
+    with_display(display, |screen| {
+        screen.show_feedback(callsign, correct, score_delta)
+    })
 }
 
 fn show_panic(display: &SharedDisplay, callsign: &str) -> Result<()> {
-    display
-        .lock()
-        .map_err(|_| anyhow!("display lock poisoned"))?
-        .show_panic(callsign)
+    with_display(display, |screen| screen.show_panic(callsign))
 }
 
 fn show_recovered(display: &SharedDisplay, callsign: &str) -> Result<()> {
-    display
-        .lock()
-        .map_err(|_| anyhow!("display lock poisoned"))?
-        .show_recovered(callsign)
+    with_display(display, |screen| screen.show_recovered(callsign))
 }
 
 fn show_waiting(display: &SharedDisplay, callsign: &str) -> Result<()> {
-    display
-        .lock()
-        .map_err(|_| anyhow!("display lock poisoned"))?
-        .show_waiting(callsign)
+    with_display(display, |screen| screen.show_waiting(callsign))
 }
 
 fn validate_config() -> Result<()> {
