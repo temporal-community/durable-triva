@@ -691,4 +691,27 @@ mod tests {
         let error = build_deck(7, 10_000).unwrap_err();
         assert!(error.to_string().contains("unique questions are available"));
     }
+
+    #[test]
+    fn the_shipped_deck_stays_inside_the_payload_budget() {
+        // Review finding W2. `main.rs` ships 500 questions as GameInput, which
+        // lands in WorkflowExecutionStarted and stays in History for the life
+        // of the execution. The server warns on blobs over 512 KB.
+        let deck = crate::questions::build_deck(11, 500).expect("build the shipped deck");
+        let input = crate::model::GameInput {
+            game_id: "round-under-test".to_owned(),
+            questions: deck,
+            duration_seconds: crate::model::GAME_SECONDS,
+            backlog_override: None,
+            detected_badge_count: Some(10),
+            index_search_attributes: true,
+        };
+        let bytes = serde_json::to_vec(&input)
+            .expect("serialize GameInput")
+            .len();
+        assert!(
+            bytes < 512 * 1024,
+            "GameInput is {bytes} bytes, over the 512 KB blob warning"
+        );
+    }
 }

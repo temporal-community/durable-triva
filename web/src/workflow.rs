@@ -660,4 +660,83 @@ mod tests {
             }
         ));
     }
+
+    #[test]
+    fn an_expired_modifier_is_not_reported_as_active() {
+        // Review finding L2. `validate_apply_chaos` rejects a new powerup with
+        // "<X> is already active" whenever `active_modifier` returns Some, but
+        // `active_modifier` only tests `.is_some()` and never compares against
+        // the clock. `expire_chaos` clears the field once per loop tick, so for
+        // up to a second after a modifier expires the operator's next powerup
+        // is rejected by an Update validator citing a modifier that has ended.
+        let mut snapshot = GameSnapshot::default();
+        snapshot.chaos.double_points_until_unix_ms = Some(1_000);
+        let now_unix_ms = 5_000;
+
+        // The time-aware half of the pair has already stopped doubling.
+        assert_eq!(active_points(&snapshot, now_unix_ms), 1);
+
+        // So the validator must not still call the round modified.
+        assert_eq!(
+            active_modifier(&snapshot),
+            None,
+            "double points expired at 1000, it is now {now_unix_ms}"
+        );
+    }
+
+    #[test]
+    fn rust_only_scheduling_falls_back_when_the_rust_pool_is_empty() {
+        let mut available: VecDeque<Question> = [
+            question("general-1", "general"),
+            question("general-2", "general"),
+        ]
+        .into_iter()
+        .collect();
+        assert!(
+            take_next_question(&mut available, true).is_none(),
+            "rust-only must not silently deal a non-rust question"
+        );
+        assert_eq!(available.len(), 2, "a refused deal leaves the deck intact");
+        assert_eq!(
+            take_next_question(&mut available, false).map(|q| q.id),
+            Some("general-1".to_owned())
+        );
+    }
+
+    #[test]
+    fn expire_chaos_leaves_a_live_modifier_alone() {
+        let mut snapshot = GameSnapshot::default();
+        snapshot.chaos.double_points_until_unix_ms = Some(10_000);
+        snapshot.chaos.rust_only_until_unix_ms = Some(4_000);
+        expire_chaos(&mut snapshot, 4_000);
+        assert_eq!(
+            snapshot.chaos.double_points_until_unix_ms,
+            Some(10_000),
+            "still in the future"
+        );
+        assert_eq!(
+            snapshot.chaos.rust_only_until_unix_ms, None,
+            "expiry is inclusive of the boundary"
+        );
+    }
+
+    #[test]
+    fn a_retry_on_the_same_badge_is_not_a_reassignment() {
+        let previous = BadgeEvent {
+            badge_id: "badge-a".to_owned(),
+            callsign: "A".to_owned(),
+            question_id: "q".to_owned(),
+            attempt: 1,
+        };
+        assert!(
+            !is_reassignment(
+                &previous,
+                &BadgeEvent {
+                    attempt: 2,
+                    ..previous.clone()
+                }
+            ),
+            "same badge picking its own question back up is a retry, not a handoff"
+        );
+    }
 }

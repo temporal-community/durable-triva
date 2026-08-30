@@ -465,4 +465,119 @@ mod tests {
         .expect("legacy BadgeEvent payload");
         assert_eq!(event.attempt, 1);
     }
+
+    fn player(badge_id: &str, score: i32) -> PlayerScore {
+        PlayerScore {
+            badge_id: badge_id.to_owned(),
+            callsign: badge_id.to_uppercase(),
+            score,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_scoreless_round_names_every_badge_that_joined() {
+        // Pins current behaviour rather than endorsing it. `badge_started`
+        // inserts a player at zero before that badge has answered anything, so
+        // a round whose timer beats the first answer leaves the whole field
+        // tied at the maximum and every panel reads WINNER.
+        let mut state = GameSnapshot::default();
+        for badge_id in ["badge-a", "badge-b", "badge-c"] {
+            state
+                .players
+                .insert(badge_id.to_owned(), player(badge_id, 0));
+        }
+        state.finish();
+        assert_eq!(state.winners, ["BADGE-A", "BADGE-B", "BADGE-C"]);
+    }
+
+    #[test]
+    fn a_round_nobody_joined_has_no_winner() {
+        let mut state = GameSnapshot::default();
+        state.finish();
+        assert!(state.winners.is_empty());
+        assert_eq!(
+            state.events.last().map(|event| event.text.as_str()),
+            Some("Round finished with no answers"),
+            "the empty-field message is the only path that reports no winner"
+        );
+    }
+
+    #[test]
+    fn a_negative_field_still_names_the_least_bad_badge() {
+        let mut state = GameSnapshot::default();
+        state.players.insert("a".to_owned(), player("a", -1));
+        state.players.insert("b".to_owned(), player("b", -6));
+        state.finish();
+        assert_eq!(state.winners, ["A"]);
+    }
+
+    #[test]
+    fn the_event_window_drops_answers_before_faults() {
+        let mut state = GameSnapshot::default();
+        state.push_kind(EventKind::Fault, "first fault".to_owned());
+        for index in 0..EVENT_WINDOW * 2 {
+            state.push_kind(EventKind::Answer, format!("answer {index}"));
+        }
+        assert_eq!(state.events.len(), EVENT_WINDOW);
+        assert_eq!(
+            state.events.first().map(|event| event.text.as_str()),
+            Some("first fault"),
+            "the fault survived {} routine answers",
+            EVENT_WINDOW * 2
+        );
+    }
+
+    #[test]
+    fn the_event_window_evicts_the_oldest_when_nothing_is_an_answer() {
+        let mut state = GameSnapshot::default();
+        for index in 0..EVENT_WINDOW + 3 {
+            state.push_kind(EventKind::Fault, format!("fault {index}"));
+        }
+        assert_eq!(state.events.len(), EVENT_WINDOW);
+        assert_eq!(
+            state.events.first().map(|event| event.text.as_str()),
+            Some("fault 3"),
+            "with no answer to sacrifice it falls back to the oldest event"
+        );
+    }
+
+    #[test]
+    fn an_in_flight_badge_survives_the_thirty_second_extension() {
+        let question = Question {
+            id: "q-1".to_owned(),
+            category: "rust".to_owned(),
+            difficulty: "easy".to_owned(),
+            prompt: "?".to_owned(),
+            answers: [
+                "a".to_owned(),
+                "b".to_owned(),
+                "c".to_owned(),
+                "d".to_owned(),
+            ],
+            correct_index: 0,
+        };
+        let extended = QuestionTask {
+            game_id: "g".to_owned(),
+            deadline_unix_ms: 60_000,
+            max_deadline_unix_ms: 90_000,
+            question: question.clone(),
+        };
+        assert_eq!(extended.latest_possible_deadline_unix_ms(), 90_000);
+
+        // Histories written before the field existed decode it as zero, which
+        // must not pull the ceiling below the real deadline.
+        let legacy = QuestionTask {
+            max_deadline_unix_ms: 0,
+            ..extended
+        };
+        assert_eq!(legacy.latest_possible_deadline_unix_ms(), 60_000);
+    }
+
+    #[test]
+    fn an_unquoted_hash_without_leading_space_stays_in_the_value() {
+        let values = parse_env("TAG=build#42\nNOTE=value # comment").unwrap();
+        assert_eq!(values["TAG"], "build#42");
+        assert_eq!(values["NOTE"], "value");
+    }
 }
