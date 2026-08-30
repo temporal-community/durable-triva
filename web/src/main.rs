@@ -7,7 +7,10 @@ use temporal_trivia_web::cloud;
 use std::{
     collections::HashSet,
     convert::Infallible,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -74,6 +77,12 @@ struct AppState {
     events: broadcast::Sender<String>,
     instance_id: String,
     restored_snapshot_digest: Arc<RwLock<String>>,
+    /// Whether a Workflow Query to Temporal has actually succeeded.
+    ///
+    /// The recovery proof is the page that claims this process rebuilt its
+    /// state from Temporal rather than from memory, so reporting a literal
+    /// `true` made the one claim worth checking unfalsifiable.
+    temporal_query_succeeded: Arc<AtomicBool>,
 }
 
 #[derive(Default, Deserialize)]
@@ -150,6 +159,7 @@ async fn main() -> Result<()> {
         events,
         instance_id: Uuid::new_v4().to_string(),
         restored_snapshot_digest: Arc::new(RwLock::new(String::new())),
+        temporal_query_succeeded: Arc::new(AtomicBool::new(false)),
     };
     let server = async move {
         // Poll the Workflow concurrently with `worker.run()`, but do not
@@ -229,7 +239,7 @@ async fn recovery_proof(State(state): State<AppState>) -> Json<RecoveryProof> {
     Json(RecoveryProof {
         process_id: std::process::id(),
         instance_id: state.instance_id.clone(),
-        temporal_query_succeeded: true,
+        temporal_query_succeeded: state.temporal_query_succeeded.load(Ordering::Acquire),
         restored_snapshot_digest: state.restored_snapshot_digest.read().await.clone(),
         snapshot_digest: snapshot_digest(&snapshot),
         snapshot,
@@ -551,11 +561,17 @@ async fn resume_active_game(state: AppState) {
         .query(GameWorkflow::snapshot, (), WorkflowQueryOptions::default())
         .await
     else {
+        state
+            .temporal_query_succeeded
+            .store(false, Ordering::Release);
         let snapshot = state.snapshot.read().await;
         let digest = snapshot_digest(&snapshot);
         *state.restored_snapshot_digest.write().await = digest;
         return;
     };
+    state
+        .temporal_query_succeeded
+        .store(true, Ordering::Release);
     *state.restored_snapshot_digest.write().await = snapshot_digest(&snapshot);
     let Some(game_id) = snapshot.game_id.clone() else {
         return;
@@ -586,6 +602,9 @@ async fn observe_workflow(
         {
             Ok(snapshot) => {
                 consecutive_errors = 0;
+                state
+                    .temporal_query_succeeded
+                    .store(true, Ordering::Release);
                 let finished = snapshot.status == GameStatus::Finished;
                 publish(&state, snapshot).await;
                 if finished {
