@@ -241,6 +241,7 @@ impl GameWorkflow {
 
     #[signal]
     pub fn badge_started(&mut self, ctx: &mut SyncWorkflowContext<Self>, event: BadgeEvent) {
+        let mut reassigned = false;
         if let Some(previous) = self.assignments.get(&event.question_id)
             && is_reassignment(previous, &event)
         {
@@ -258,6 +259,7 @@ impl GameWorkflow {
                 reason,
                 attempt: event.attempt,
             };
+            reassigned = true;
             self.snapshot.reassignments += 1;
             self.snapshot.heartbeat_timeouts += 1;
             self.snapshot.latest_reassignment = Some(reassignment.clone());
@@ -283,7 +285,8 @@ impl GameWorkflow {
         {
             self.snapshot.activity_attempts += 1;
         }
-        if !self.snapshot.players.contains_key(&event.badge_id) {
+        let joined = !self.snapshot.players.contains_key(&event.badge_id);
+        if joined {
             self.snapshot.players.insert(
                 event.badge_id.clone(),
                 PlayerScore {
@@ -295,7 +298,7 @@ impl GameWorkflow {
             self.snapshot
                 .push_event(format!("{} joined", event.callsign));
         }
-        if self.index_search_attributes {
+        if should_upsert_running_attributes(self.index_search_attributes, joined, reassigned) {
             ctx.upsert_search_attributes([
                 SearchAttributeKey::int("TriviaBadgeCount")
                     .value_set(self.snapshot.players.len() as i64),
@@ -515,6 +518,17 @@ fn active_points(snapshot: &GameSnapshot, now_unix_ms: u64) -> i32 {
     } else {
         1
     }
+}
+
+/// Whether a `badge_started` Signal actually changed either indexed value.
+///
+/// `TriviaBadgeCount` moves only when a badge joins and `TriviaReassignments`
+/// only on a handoff, but the Signal fires once per Activity attempt --
+/// roughly 245 times in a full round against about ten joins. Upserting
+/// regardless wrote the same numbers back ~225 times per round, each costing
+/// a History event and a visibility-store write.
+fn should_upsert_running_attributes(indexing: bool, joined: bool, reassigned: bool) -> bool {
+    indexing && (joined || reassigned)
 }
 
 fn is_reassignment(previous: &BadgeEvent, current: &BadgeEvent) -> bool {
@@ -750,6 +764,29 @@ mod tests {
         assert_eq!(
             snapshot.chaos.rust_only_until_unix_ms, None,
             "expiry is inclusive of the boundary"
+        );
+    }
+
+    #[test]
+    fn running_attributes_are_upserted_only_when_a_value_changed() {
+        // The Signal fires once per Activity attempt; the indexed values move
+        // on a join or a handoff and nothing else.
+        assert!(should_upsert_running_attributes(true, true, false), "join");
+        assert!(
+            should_upsert_running_attributes(true, false, true),
+            "handoff"
+        );
+        assert!(
+            should_upsert_running_attributes(true, true, true),
+            "a joining badge picking up reassigned work"
+        );
+        assert!(
+            !should_upsert_running_attributes(true, false, false),
+            "a routine attempt by a known badge changes neither value"
+        );
+        assert!(
+            !should_upsert_running_attributes(false, true, true),
+            "indexing off suppresses the upsert regardless"
         );
     }
 
