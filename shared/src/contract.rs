@@ -239,8 +239,16 @@ impl GameSnapshot {
         }
     }
 
+    /// How many Activities the Workflow keeps outstanding.
+    ///
+    /// GAME_SPEC: `max(1, active_badges - 1)`, reserving one badge to pick up
+    /// heartbeat-timeout retries. The controller computes that from its live
+    /// poller count and always passes it as `override_value`; this fallback
+    /// covers a `GameInput` that carries none, and used to read
+    /// `10.max(players * 2)` -- roughly triple the reserve-one rule, which
+    /// would have left nothing spare to take a reassignment.
     pub fn target_backlog(&self, override_value: Option<usize>) -> usize {
-        override_value.unwrap_or_else(|| 10.max(self.players.len() * 2))
+        override_value.unwrap_or_else(|| self.players.len().saturating_sub(1).max(1))
     }
 
     pub fn finish(&mut self) {
@@ -285,9 +293,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn backlog_scales_from_ten() {
+    fn backlog_reserves_one_badge_for_retries() {
         let mut state = GameSnapshot::default();
-        assert_eq!(state.target_backlog(None), 10);
+        // No badges yet: still schedule one, or the round cannot start.
+        assert_eq!(state.target_backlog(None), 1);
         for index in 0..8 {
             state.players.insert(
                 index.to_string(),
@@ -298,8 +307,14 @@ mod tests {
                 },
             );
         }
-        assert_eq!(state.target_backlog(None), 16);
-        assert_eq!(state.target_backlog(Some(33)), 33);
+        // Eight badges, seven playing, one held back for a reassignment --
+        // the rule GAME_SPEC states.
+        assert_eq!(state.target_backlog(None), 7);
+        assert_eq!(
+            state.target_backlog(Some(33)),
+            33,
+            "an explicit override still wins"
+        );
     }
 
     #[test]
