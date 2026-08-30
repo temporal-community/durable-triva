@@ -44,6 +44,8 @@ use temporalio_sdk::{
 };
 use temporalio_sdk_core::{ActivitySlotKind, FixedSizeSlotSupplier, TunerBuilder, Url};
 
+use badge_screen::Status;
+
 use crate::{
     display::BadgeDisplay,
     haptics::{BadgeHaptics, HapticEvent, SharedHaptics},
@@ -471,7 +473,7 @@ impl BadgeActivities {
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
             if let Ok(mut screen) = display.lock() {
-                let _ = screen.show_status(&identity.callsign, "RESULT PENDING");
+                let _ = screen.show_status(&identity.callsign, Status::ResultPending);
             }
         });
         *watcher = Some(ResultWatcher { game_id, task });
@@ -511,7 +513,7 @@ fn main() -> Result<()> {
         )
         .context("configure GPIO6 haptic PWM")?,
     )?));
-    show_status(&display, &identity.callsign, "BOOTING")?;
+    show_status(&display, &identity.callsign, Status::Booting)?;
 
     let sys_loop = EspSystemEventLoop::take().context("take system event loop")?;
     let nvs_partition = EspDefaultNvsPartition::take().context("take default NVS")?;
@@ -520,9 +522,9 @@ fn main() -> Result<()> {
         EspWifi::new(peripherals.modem, sys_loop.clone(), Some(nvs_partition))?,
         sys_loop,
     )?;
-    show_status(&display, &identity.callsign, "CONNECTING WIFI")?;
+    show_status(&display, &identity.callsign, Status::ConnectingWifi)?;
     connect_wifi(&mut wifi)?;
-    show_status(&display, &identity.callsign, "SYNCING TIME")?;
+    show_status(&display, &identity.callsign, Status::SyncingTime)?;
     let (_sntp, used_network_time) = sync_clock()?;
     if !used_network_time {
         log::warn!("using firmware build timestamp for TLS validation");
@@ -555,7 +557,7 @@ async fn run_worker(
     } else {
         format!("https://{TEMPORAL_ADDRESS}")
     };
-    show_status(&display, &identity.callsign, "CONNECTING CLOUD")?;
+    show_status(&display, &identity.callsign, Status::ConnectingCloud)?;
     let roots = RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     let verifier = WebPkiServerVerifier::builder(Arc::new(roots))
         .build()
@@ -708,11 +710,11 @@ fn unix_ms() -> u64 {
         .as_millis() as u64
 }
 
-fn show_status(display: &SharedDisplay, title: &str, detail: &str) -> Result<()> {
+fn show_status(display: &SharedDisplay, title: &str, status: Status) -> Result<()> {
     display
         .lock()
         .map_err(|_| anyhow!("display lock poisoned"))?
-        .show_status(title, detail)
+        .show_status(title, status)
 }
 
 fn show_question(display: &SharedDisplay, callsign: &str, task: &QuestionTask) -> Result<()> {

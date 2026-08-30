@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
-use badge_screen::{Canvas, HEIGHT, WIDTH};
+use badge_screen::{Canvas, HEIGHT, Status, WIDTH};
 use temporal_trivia_shared::{ChaosCommand, GameSnapshot, GameStatus, PlayerScore, Question};
 
 const SCALE: usize = 3;
@@ -65,16 +65,13 @@ fn screens() -> Vec<(String, Canvas)> {
         out.push((label.to_owned(), canvas));
     };
 
-    for headline in [
-        "BOOTING",
-        "CONNECTING WIFI",
-        "SYNCING TIME",
-        "CONNECTING CLOUD",
-        "RESULT PENDING",
-    ] {
-        push(&format!("status: {headline}"), &|canvas: &mut Canvas| {
-            canvas.status(CALLSIGN, headline, "");
-        });
+    for status in Status::ALL {
+        push(
+            &format!("status: {}", status.headline()),
+            &|canvas: &mut Canvas| {
+                canvas.status(CALLSIGN, status);
+            },
+        );
     }
     push("waiting (idle worker)", &|canvas| canvas.waiting(CALLSIGN));
     push("question", &|canvas| canvas.question(CALLSIGN, &question()));

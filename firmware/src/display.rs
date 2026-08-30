@@ -5,7 +5,7 @@
 //! owns the panel and nothing else.
 
 use anyhow::{Context, Result, bail};
-use badge_screen::{Canvas, WIDTH};
+use badge_screen::{Canvas, Status, WIDTH};
 use esp_idf_svc::hal::{
     delay::BLOCK,
     gpio::{Gpio4, Gpio5},
@@ -39,9 +39,8 @@ impl BadgeDisplay {
         Ok(display)
     }
 
-    pub fn show_status(&mut self, callsign: &str, detail: &str) -> Result<()> {
-        let (headline, subline) = detail.split_once('\n').unwrap_or((detail, ""));
-        self.canvas.status(callsign, headline, subline);
+    pub fn show_status(&mut self, callsign: &str, status: Status) -> Result<()> {
+        self.canvas.status(callsign, status);
         self.flush()
     }
 

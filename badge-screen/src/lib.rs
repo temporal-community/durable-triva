@@ -38,6 +38,54 @@ const ANSWER_LABEL_LINES: usize = 2;
 const PROMPT_CHARS: usize = 31;
 const PROMPT_LINES: usize = 3;
 
+/// A boot-sequence screen.
+///
+/// Headline and instruction travel together: they used to be a `&str` headline
+/// and a `match` on its text, so a typo silently fell through to "PLEASE WAIT"
+/// instead of failing to compile.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Status {
+    Booting,
+    ConnectingWifi,
+    SyncingTime,
+    ConnectingCloud,
+    ResultPending,
+}
+
+impl Status {
+    /// Every variant, in the order the badge reaches them. `preview` renders
+    /// this, so a new variant cannot be added without a picture of it.
+    pub const ALL: [Self; 5] = [
+        Self::Booting,
+        Self::ConnectingWifi,
+        Self::SyncingTime,
+        Self::ConnectingCloud,
+        Self::ResultPending,
+    ];
+
+    #[must_use]
+    pub const fn headline(self) -> &'static str {
+        match self {
+            Self::Booting => "BOOTING",
+            Self::ConnectingWifi => "CONNECTING WIFI",
+            Self::SyncingTime => "SYNCING TIME",
+            Self::ConnectingCloud => "CONNECTING CLOUD",
+            Self::ResultPending => "RESULT PENDING",
+        }
+    }
+
+    #[must_use]
+    pub const fn instruction(self) -> &'static str {
+        match self {
+            Self::Booting => "STARTING RUST WORKER",
+            Self::ConnectingWifi => "JOINING BADGE NETWORK",
+            Self::SyncingTime => "PREPARING CLOUD TLS",
+            Self::ConnectingCloud => "CONNECTING TEMPORAL",
+            Self::ResultPending => "TEMPORAL HAS THE RESULT",
+        }
+    }
+}
+
 /// A 1-bit 128x64 framebuffer laid out the way the SSD1306 expects it.
 #[derive(Clone)]
 pub struct Canvas {
@@ -81,16 +129,8 @@ impl Canvas {
 
     // ---------- screens ----------
 
-    pub fn status(&mut self, callsign: &str, headline: &str, subline: &str) {
-        let instruction = match headline {
-            "BOOTING" => "STARTING RUST WORKER",
-            "CONNECTING WIFI" => "JOINING BADGE NETWORK",
-            "SYNCING TIME" => "PREPARING CLOUD TLS",
-            "CONNECTING CLOUD" => "CONNECTING TEMPORAL",
-            "RESULT PENDING" => "TEMPORAL HAS THE RESULT",
-            _ => "PLEASE WAIT",
-        };
-        self.centered(callsign, headline, subline, &[instruction]);
+    pub fn status(&mut self, callsign: &str, status: Status) {
+        self.centered(callsign, status.headline(), "", &[status.instruction()]);
     }
 
     pub fn waiting(&mut self, callsign: &str) {
@@ -821,6 +861,36 @@ mod tests {
         for line in &lines {
             assert!(line.chars().count() <= 11, "{line:?} is too wide");
         }
+    }
+
+    #[test]
+    fn every_status_screen_draws_and_fits_the_panel() {
+        for status in Status::ALL {
+            let mut canvas = Canvas::new();
+            canvas.status("KEEN-RAVEN-C8", status);
+            assert!(lit(&canvas) > 0, "{:?} drew an empty panel", status);
+            assert!(
+                status.instruction().chars().count() <= MAX_COMPACT_CHARS,
+                "{:?} instruction is {} chars, panel fits {MAX_COMPACT_CHARS}",
+                status,
+                status.instruction().chars().count()
+            );
+        }
+    }
+
+    #[test]
+    fn status_headlines_are_distinct() {
+        // ALL is what preview renders; a duplicated headline would silently
+        // drop a screen from the contact sheet.
+        let mut seen = std::collections::BTreeSet::new();
+        for status in Status::ALL {
+            assert!(
+                seen.insert(status.headline()),
+                "duplicate headline {:?}",
+                status.headline()
+            );
+        }
+        assert_eq!(seen.len(), Status::ALL.len());
     }
 
     #[test]
