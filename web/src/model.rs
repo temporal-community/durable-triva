@@ -1,3 +1,4 @@
+pub use temporal_trivia_shared::identity::is_badge_worker_identity;
 pub use temporal_trivia_shared::{
     AnswerSpotlight, BADGE_TASK_QUEUE, BadgeAnswer, BadgeEvent, BadgeFailure, CHAOS_DURATION_MS,
     ChaosCommand, EventKind, GAME_EXTENSION_MS, GAME_SECONDS, GameInput, GameSnapshot, GameStatus,

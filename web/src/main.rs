@@ -46,7 +46,7 @@ use uuid::Uuid;
 use crate::{
     model::{
         BADGE_TASK_QUEUE, ChaosCommand, GAME_SECONDS, GameInput, GameSnapshot, GameStatus,
-        RoundMemo, WEB_TASK_QUEUE,
+        RoundMemo, WEB_TASK_QUEUE, is_badge_worker_identity,
     },
     workflow::{GameWorkflow, GameWorkflowRun},
 };
@@ -420,10 +420,6 @@ async fn active_badge_count(client: &Client) -> Result<usize> {
 
 fn recovery_capacity(badge_count: usize) -> usize {
     badge_count.saturating_sub(1).max(1)
-}
-
-fn is_badge_worker_identity(identity: &str) -> bool {
-    identity.starts_with("badge/") || identity.starts_with("esp32-")
 }
 
 /// Update rejections come back as `Update failed:` and mean the Workflow's
@@ -842,10 +838,17 @@ mod tests {
         assert_eq!(recovery_capacity(10), 9);
     }
 
+    use temporal_trivia_shared::identity_from_mac;
+
     #[test]
     fn badge_worker_identity_accepts_named_and_legacy_badges_only() {
+        // The prefixes now come from shared::identity alongside the firmware
+        // code that produces them; this keeps the controller's own use of the
+        // predicate covered from here.
         assert!(is_badge_worker_identity("badge/KEEN-RAVEN-C8"));
-        assert!(is_badge_worker_identity("esp32-e83dc1f94bc8"));
+        assert!(is_badge_worker_identity(
+            &identity_from_mac([0xe8, 0x3d, 0xc1, 0xf9, 0x4b, 0xc8]).id
+        ));
         assert!(!is_badge_worker_identity("63305@Fatehowler.local"));
     }
 }
