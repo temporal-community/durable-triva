@@ -7,6 +7,7 @@ use temporal_trivia_web::cloud;
 use std::{
     collections::HashSet,
     convert::Infallible,
+    future::Future,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -561,25 +562,70 @@ fn system_time_unix_ms(time: SystemTime) -> u64 {
         .as_millis() as u64
 }
 
+/// The Workflow Query the recovery proof rests on.
+///
+/// A trait so the health flag's transitions can be exercised without a live
+/// `Client`: the real implementation talks to Temporal, and the tests hand in
+/// a source that answers or refuses on demand.
+trait SnapshotQuery {
+    fn snapshot(&self) -> impl Future<Output = Result<GameSnapshot>> + Send;
+}
+
+impl SnapshotQuery for WorkflowHandle<Client, GameWorkflowRun> {
+    async fn snapshot(&self) -> Result<GameSnapshot> {
+        self.query(GameWorkflow::snapshot, (), WorkflowQueryOptions::default())
+            .await
+            .map_err(|error| anyhow!("query Workflow snapshot: {error}"))
+    }
+}
+
+/// What a failed Query means for the claim that Temporal answered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OnQueryFailure {
+    /// Startup: a failure means this process did *not* rebuild from Temporal,
+    /// so the recovery proof must stop claiming it did.
+    Retract,
+    /// Steady state: a transient poll failure does not undo a rebuild that
+    /// already happened.
+    Keep,
+}
+
+/// Runs the Query and records whether Temporal actually answered.
+async fn query_recording_health<Q: SnapshotQuery>(
+    query: &Q,
+    health: &AtomicBool,
+    on_failure: OnQueryFailure,
+) -> Result<GameSnapshot> {
+    match query.snapshot().await {
+        Ok(snapshot) => {
+            health.store(true, Ordering::Release);
+            Ok(snapshot)
+        }
+        Err(error) => {
+            if on_failure == OnQueryFailure::Retract {
+                health.store(false, Ordering::Release);
+            }
+            Err(error)
+        }
+    }
+}
+
 async fn resume_active_game(state: AppState) {
     let handle = state
         .client
         .get_workflow_handle::<GameWorkflowRun>(ACTIVE_WORKFLOW_ID);
-    let Ok(snapshot) = handle
-        .query(GameWorkflow::snapshot, (), WorkflowQueryOptions::default())
-        .await
+    let Ok(snapshot) = query_recording_health(
+        &handle,
+        &state.temporal_query_succeeded,
+        OnQueryFailure::Retract,
+    )
+    .await
     else {
-        state
-            .temporal_query_succeeded
-            .store(false, Ordering::Release);
         let snapshot = state.snapshot.read().await;
         let digest = snapshot_digest(&snapshot);
         *state.restored_snapshot_digest.write().await = digest;
         return;
     };
-    state
-        .temporal_query_succeeded
-        .store(true, Ordering::Release);
     *state.restored_snapshot_digest.write().await = snapshot_digest(&snapshot);
     let Some(game_id) = snapshot.game_id.clone() else {
         return;
@@ -604,15 +650,15 @@ async fn observe_workflow(
         if state.active_workflow.lock().await.as_deref() != Some(&game_id) {
             return;
         }
-        match handle
-            .query(GameWorkflow::snapshot, (), WorkflowQueryOptions::default())
-            .await
+        match query_recording_health(
+            &handle,
+            &state.temporal_query_succeeded,
+            OnQueryFailure::Keep,
+        )
+        .await
         {
             Ok(snapshot) => {
                 consecutive_errors = 0;
-                state
-                    .temporal_query_succeeded
-                    .store(true, Ordering::Release);
                 let finished = snapshot.status == GameStatus::Finished;
                 publish(&state, snapshot).await;
                 if finished {
@@ -664,6 +710,109 @@ async fn connect_cloud() -> Result<Client> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `SnapshotQuery` that answers or refuses on command, so the health
+    /// flag can be driven through every transition without a live `Client`.
+    struct FakeQuery {
+        answers: std::sync::Mutex<Vec<bool>>,
+    }
+
+    impl FakeQuery {
+        fn new(answers: [bool; 3]) -> Self {
+            let mut answers = answers.to_vec();
+            answers.reverse();
+            Self {
+                answers: std::sync::Mutex::new(answers),
+            }
+        }
+    }
+
+    impl SnapshotQuery for FakeQuery {
+        async fn snapshot(&self) -> Result<GameSnapshot> {
+            if self.answers.lock().expect("fake lock").pop() == Some(true) {
+                Ok(GameSnapshot::default())
+            } else {
+                Err(anyhow!("Temporal did not answer"))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_query_at_startup_retracts_the_recovery_claim() {
+        let health = AtomicBool::new(false);
+        let query = FakeQuery::new([true, false, true]);
+
+        // A first answer earns the claim.
+        assert!(
+            query_recording_health(&query, &health, OnQueryFailure::Retract)
+                .await
+                .is_ok()
+        );
+        assert!(health.load(Ordering::Acquire));
+
+        // A failure on the startup path takes it back: this process did not
+        // rebuild from Temporal, whatever its in-memory snapshot says.
+        assert!(
+            query_recording_health(&query, &health, OnQueryFailure::Retract)
+                .await
+                .is_err()
+        );
+        assert!(
+            !health.load(Ordering::Acquire),
+            "a failed resume must not keep claiming Temporal answered"
+        );
+
+        // And it can be earned back.
+        assert!(
+            query_recording_health(&query, &health, OnQueryFailure::Retract)
+                .await
+                .is_ok()
+        );
+        assert!(health.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn a_transient_poll_failure_does_not_retract_a_rebuild() {
+        let health = AtomicBool::new(false);
+        let query = FakeQuery::new([true, false, false]);
+
+        assert!(
+            query_recording_health(&query, &health, OnQueryFailure::Keep)
+                .await
+                .is_ok()
+        );
+        assert!(health.load(Ordering::Acquire));
+
+        for _ in 0..2 {
+            assert!(
+                query_recording_health(&query, &health, OnQueryFailure::Keep)
+                    .await
+                    .is_err()
+            );
+            assert!(
+                health.load(Ordering::Acquire),
+                "the rebuild already happened; a dropped poll does not undo it"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_recovery_claim_starts_false() {
+        // The bug this replaced was a literal `true` in the response body, so
+        // the untouched default is the case worth pinning.
+        let health = AtomicBool::new(false);
+        assert!(!health.load(Ordering::Acquire));
+        let query = FakeQuery::new([false, false, false]);
+        assert!(
+            query_recording_health(&query, &health, OnQueryFailure::Keep)
+                .await
+                .is_err()
+        );
+        assert!(
+            !health.load(Ordering::Acquire),
+            "never answered, never claims it did"
+        );
+    }
 
     #[test]
     fn observer_backoff_is_bounded() {
