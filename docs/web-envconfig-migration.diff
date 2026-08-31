@@ -1,0 +1,377 @@
+diff -ruN a/web/Cargo.toml b/web/Cargo.toml
+--- a/web/Cargo.toml	2026-08-25 14:56:06
++++ b/web/Cargo.toml	2026-08-27 11:10:59
+@@ -16,7 +16,7 @@
+ sha2 = "0.10"
+ temporal-trivia-shared = { path = "../shared" }
+ temporalio-client = { version = "=0.7.0", default-features = false }
+-temporalio-common = { version = "=0.7.0", default-features = false }
++temporalio-common = { version = "=0.7.0", default-features = false, features = ["envconfig"] }
+ temporalio-macros = "=0.7.0"
+ temporalio-sdk = { version = "=0.7.0", default-features = false }
+ temporalio-sdk-core = { version = "=0.7.0", default-features = false, features = ["tls-ring"] }
+diff -ruN a/web/src/bin/simulate_badges.rs b/web/src/bin/simulate_badges.rs
+--- a/web/src/bin/simulate_badges.rs	2026-08-25 14:56:06
++++ b/web/src/bin/simulate_badges.rs	2026-08-27 11:13:31
+@@ -1,7 +1,4 @@
+ use std::{
+-    collections::HashMap,
+-    path::{Path, PathBuf},
+-    str::FromStr,
+     sync::{
+         Arc,
+         atomic::{AtomicU64, Ordering},
+@@ -13,9 +10,8 @@
+ use temporal_trivia_shared::{
+     BADGE_TASK_QUEUE, BadgeAnswer, BadgeEvent, GameInput, GameSnapshot, QuestionTask,
+ };
+-use temporalio_client::{
+-    Client, ClientOptions, Connection, ConnectionOptions, TlsOptions, WorkflowSignalOptions,
+-};
++use temporal_trivia_web::cloud;
++use temporalio_client::{Client, WorkflowSignalOptions};
+ use temporalio_common::worker::WorkerDeploymentOptions;
+ use temporalio_macros::{activities, workflow, workflow_methods};
+ use temporalio_sdk::{
+@@ -24,7 +20,7 @@
+     activities::{ActivityContext, ActivityError},
+     runtime::RuntimeOptions,
+ };
+-use temporalio_sdk_core::{ActivitySlotKind, FixedSizeSlotSupplier, TunerBuilder, Url};
++use temporalio_sdk_core::{ActivitySlotKind, FixedSizeSlotSupplier, TunerBuilder};
+ 
+ const MAX_BADGE_INDEX: usize = 100;
+ 
+@@ -171,60 +167,6 @@
+ }
+ 
+ async fn connect_cloud() -> Result<Client> {
+-    let settings = read_cloud_settings()?;
+-    let address = required(&settings, "TEMPORAL_ADDRESS")?;
+-    let target = if address.contains("://") {
+-        address.to_owned()
+-    } else {
+-        format!("https://{address}")
+-    };
+-    let options = ConnectionOptions::new(Url::from_str(&target)?)
+-        .api_key(required(&settings, "TEMPORAL_API_KEY")?)
+-        .tls_options(TlsOptions::default())
+-        .build();
+-    let connection = Connection::connect(options).await?;
+-    Client::new(
+-        connection,
+-        ClientOptions::new(required(&settings, "TEMPORAL_NAMESPACE")?).build(),
+-    )
+-    .map_err(Into::into)
+-}
+-
+-fn read_cloud_settings() -> Result<HashMap<String, String>> {
+-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+-    let project = manifest.parent().context("locate repository root")?;
+-    let local_path = project.join(".env");
+-    let fallback_path = project.join(".env.temporal");
+-    let path = std::env::var_os("TEMPORAL_ENV_FILE")
+-        .map(PathBuf::from)
+-        .or_else(|| local_path.is_file().then_some(local_path))
+-        .unwrap_or(fallback_path);
+-    let mut settings = if path.is_file() {
+-        parse_env_file(&path)?
+-    } else {
+-        HashMap::new()
+-    };
+-    for key in ["TEMPORAL_ADDRESS", "TEMPORAL_NAMESPACE", "TEMPORAL_API_KEY"] {
+-        if let Ok(value) = std::env::var(key)
+-            && !value.is_empty()
+-        {
+-            settings.insert(key.to_owned(), value);
+-        }
+-    }
+-    Ok(settings)
+-}
+-
+-fn parse_env_file(path: &Path) -> Result<HashMap<String, String>> {
+-    let content = std::fs::read_to_string(path)
+-        .with_context(|| format!("read Temporal settings from {}", path.display()))?;
+-    temporal_trivia_shared::parse_env(&content)
+-        .with_context(|| format!("parse Temporal settings from {}", path.display()))
+-}
+-
+-fn required<'a>(settings: &'a HashMap<String, String>, name: &str) -> Result<&'a str> {
+-    let value = settings.get(name).map(String::as_str).unwrap_or("");
+-    if value.is_empty() {
+-        bail!("missing {name}; set it in the environment or .env.temporal");
+-    }
+-    Ok(value)
++    let profile = cloud::load_profile()?;
++    cloud::connect(&profile).await
+ }
+diff -ruN a/web/src/cloud.rs b/web/src/cloud.rs
+--- a/web/src/cloud.rs	1969-12-31 19:00:00
++++ b/web/src/cloud.rs	2026-08-27 11:10:21
+@@ -0,0 +1,138 @@
++//! Temporal Cloud connection settings for the operator-side binaries.
++//!
++//! Resolution is delegated to the SDK's own `envconfig` support so this project
++//! behaves the way the `temporal` CLI does: a `temporal.toml` profile
++//! underneath, `TEMPORAL_*` environment variables layered on top. The
++//! repository's dotenv file is read first and folded into that environment
++//! view, which is how the demo has always been configured.
++//!
++//! Both `temporal-trivia-web` and the `simulate_badges` helper used to carry
++//! their own copy of this logic. They now share one, so the resolution rules
++//! cannot drift apart again.
++
++use std::{collections::HashMap, path::PathBuf, str::FromStr};
++
++use anyhow::{Context, Result, anyhow, bail};
++use temporalio_client::{Client, ClientOptions, Connection, ConnectionOptions, TlsOptions};
++use temporalio_common::envconfig::{
++    ClientConfigProfile, LoadClientConfigProfileOptions, load_client_config_profile,
++};
++use temporalio_sdk_core::Url;
++
++/// Environment variable naming an explicit dotenv file. When it is set the file
++/// must exist: a typo has to fail loudly rather than silently starting the
++/// controller with no Temporal settings at all. `firmware/build.rs` has always
++/// asserted this, and the operator binaries now agree with it.
++const ENV_FILE_VARIABLE: &str = "TEMPORAL_ENV_FILE";
++
++/// Resolve a Temporal client profile from `temporal.toml`, the dotenv file, and
++/// the process environment, in the SDK's documented precedence order.
++pub fn load_profile() -> Result<ClientConfigProfile> {
++    let mut environment = dotenv_values()?;
++    // Real environment variables win over the dotenv file, preserving the
++    // precedence these binaries have always had. Passing an explicit map means
++    // the SDK reads only what we hand it, so the merge has to happen here.
++    environment.extend(std::env::vars());
++
++    // `ConfigError` boxes a bare `dyn Error`, which is not `Send + Sync`, so
++    // anyhow cannot absorb it with `?`. Flatten it to a message instead.
++    load_client_config_profile(
++        LoadClientConfigProfileOptions::builder().build(),
++        Some(&environment),
++    )
++    .map_err(|error| anyhow!("load Temporal client configuration: {error}"))
++}
++
++/// Read the repository's dotenv file, if one applies. Absent files are fine —
++/// the environment or a `temporal.toml` profile may carry everything needed.
++fn dotenv_values() -> Result<HashMap<String, String>> {
++    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
++    let project = manifest.parent().context("locate repository root")?;
++
++    let path = match std::env::var_os(ENV_FILE_VARIABLE) {
++        Some(explicit) => {
++            let explicit = PathBuf::from(explicit);
++            if !explicit.is_file() {
++                bail!(
++                    "{ENV_FILE_VARIABLE} points to missing file {}",
++                    explicit.display()
++                );
++            }
++            explicit
++        }
++        None => {
++            let repo_env = project.join(".env");
++            if repo_env.is_file() {
++                repo_env
++            } else {
++                project.join(".env.temporal")
++            }
++        }
++    };
++
++    if !path.is_file() {
++        return Ok(HashMap::new());
++    }
++    let content = std::fs::read_to_string(&path)
++        .with_context(|| format!("read Temporal settings from {}", path.display()))?;
++    temporal_trivia_shared::parse_env(&content)
++        .with_context(|| format!("parse Temporal settings from {}", path.display()))
++}
++
++/// Connect a client using a profile from [`load_profile`].
++pub async fn connect(profile: &ClientConfigProfile) -> Result<Client> {
++    let address = required(profile.address.as_deref(), "TEMPORAL_ADDRESS")?;
++    let namespace = required(profile.namespace.as_deref(), "TEMPORAL_NAMESPACE")?;
++    let api_key = required(profile.api_key.as_deref(), "TEMPORAL_API_KEY")?;
++
++    let target = if address.contains("://") {
++        address.to_owned()
++    } else {
++        format!("https://{address}")
++    };
++
++    // An API key implies TLS, so the only reason to leave it unset is a profile
++    // that disables it explicitly — which is how a local dev server is reached.
++    let tls = match profile.tls.as_ref() {
++        Some(tls) if tls.disabled == Some(true) => None,
++        _ => Some(TlsOptions::default()),
++    };
++
++    let options = ConnectionOptions::new(Url::from_str(&target)?)
++        .api_key(api_key)
++        .maybe_tls_options(tls)
++        .build();
++    let connection = Connection::connect(options).await?;
++    Client::new(connection, ClientOptions::new(namespace).build()).map_err(Into::into)
++}
++
++fn required<'a>(value: Option<&'a str>, name: &str) -> Result<&'a str> {
++    match value {
++        Some(value) if !value.is_empty() => Ok(value),
++        _ => bail!(
++            "missing {name}; set it in the environment, .env.temporal, or a temporal.toml profile"
++        ),
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn required_rejects_absent_and_empty_values() {
++        assert!(required(Some("ns.acct.tmprl.cloud:7233"), "TEMPORAL_ADDRESS").is_ok());
++        assert!(required(Some(""), "TEMPORAL_ADDRESS").is_err());
++        assert!(required(None, "TEMPORAL_ADDRESS").is_err());
++    }
++
++    #[test]
++    fn an_explicit_env_file_that_does_not_exist_is_an_error() {
++        // The whole point of the F2 fix: a typo in TEMPORAL_ENV_FILE must not
++        // degrade into an empty settings map.
++        unsafe { std::env::set_var(ENV_FILE_VARIABLE, "/nonexistent/temporal.env") };
++        let error = dotenv_values().expect_err("missing explicit file must fail");
++        unsafe { std::env::remove_var(ENV_FILE_VARIABLE) };
++        assert!(error.to_string().contains("points to missing file"));
++    }
++}
+diff -ruN a/web/src/lib.rs b/web/src/lib.rs
+--- a/web/src/lib.rs	1969-12-31 19:00:00
++++ b/web/src/lib.rs	2026-08-27 11:10:21
+@@ -0,0 +1,6 @@
++//! Shared internals for the operator-side binaries.
++//!
++//! `src/bin/simulate_badges.rs` cannot reach modules declared in `main.rs`, so
++//! anything both binaries need lives here instead of being copied into each.
++
++pub mod cloud;
+diff -ruN a/web/src/main.rs b/web/src/main.rs
+--- a/web/src/main.rs	2026-08-26 15:15:25
++++ b/web/src/main.rs	2026-08-27 11:13:31
+@@ -2,16 +2,16 @@
+ mod questions;
+ mod workflow;
+ 
++use temporal_trivia_web::cloud;
++
+ use std::{
+-    collections::{HashMap, HashSet},
++    collections::HashSet,
+     convert::Infallible,
+-    path::{Path, PathBuf},
+-    str::FromStr,
+     sync::Arc,
+     time::{Duration, SystemTime, UNIX_EPOCH},
+ };
+ 
+-use anyhow::{Context, Result, anyhow, bail};
++use anyhow::{Context, Result, anyhow};
+ use axum::{
+     Json, Router,
+     extract::{Path as AxumPath, State},
+@@ -23,9 +23,9 @@
+ use serde::{Deserialize, Serialize};
+ use sha2::{Digest, Sha256};
+ use temporalio_client::{
+-    Client, ClientOptions, Connection, ConnectionOptions, NamespacedClient, TlsOptions,
+-    WorkflowDescribeOptions, WorkflowExecuteUpdateOptions, WorkflowExecution, WorkflowHandle,
+-    WorkflowListOptions, WorkflowQueryOptions, WorkflowStartOptions, tonic::Request,
++    Client, NamespacedClient, WorkflowDescribeOptions, WorkflowExecuteUpdateOptions,
++    WorkflowExecution, WorkflowHandle, WorkflowListOptions, WorkflowQueryOptions,
++    WorkflowStartOptions, tonic::Request,
+ };
+ use temporalio_common::protos::temporal::api::enums::v1::{
+     TaskQueueType, WorkflowIdConflictPolicy, WorkflowIdReusePolicy,
+@@ -35,7 +35,6 @@
+ };
+ use temporalio_common::telemetry::TelemetryOptions;
+ use temporalio_sdk::{Runtime, Worker, WorkerOptions, runtime::RuntimeOptions};
+-use temporalio_sdk_core::Url;
+ use tokio::sync::{Mutex, RwLock, broadcast};
+ use tokio_stream::wrappers::BroadcastStream;
+ use uuid::Uuid;
+@@ -631,70 +630,8 @@
+ }
+ 
+ async fn connect_cloud() -> Result<Client> {
+-    let settings = read_cloud_settings()?;
+-    let address = required(&settings, "TEMPORAL_ADDRESS")?;
+-    let target = if address.contains("://") {
+-        address.to_owned()
+-    } else {
+-        format!("https://{address}")
+-    };
+-    let options = ConnectionOptions::new(Url::from_str(&target)?)
+-        .api_key(required(&settings, "TEMPORAL_API_KEY")?)
+-        .tls_options(TlsOptions::default())
+-        .build();
+-    let connection = Connection::connect(options).await?;
+-    Client::new(
+-        connection,
+-        ClientOptions::new(required(&settings, "TEMPORAL_NAMESPACE")?).build(),
+-    )
+-    .map_err(Into::into)
+-}
+-
+-fn read_cloud_settings() -> Result<HashMap<String, String>> {
+-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+-    let project = manifest.parent().context("locate repository root")?;
+-    let repo_env = project.join(".env");
+-    let local_path = if repo_env.is_file() {
+-        repo_env
+-    } else {
+-        project.join(".env.temporal")
+-    };
+-    let legacy_path = project
+-        .parent()
+-        .and_then(Path::parent)
+-        .map(|root| root.join("TrafficLight/.env"));
+-    let path = std::env::var_os("TEMPORAL_ENV_FILE")
+-        .map(PathBuf::from)
+-        .or_else(|| local_path.is_file().then_some(local_path.clone()))
+-        .unwrap_or_else(|| legacy_path.unwrap_or(local_path));
+-    let mut settings = if path.is_file() {
+-        parse_env_file(&path)?
+-    } else {
+-        HashMap::new()
+-    };
+-    for key in ["TEMPORAL_ADDRESS", "TEMPORAL_NAMESPACE", "TEMPORAL_API_KEY"] {
+-        if let Ok(value) = std::env::var(key)
+-            && !value.is_empty()
+-        {
+-            settings.insert(key.to_owned(), value);
+-        }
+-    }
+-    Ok(settings)
+-}
+-
+-fn parse_env_file(path: &Path) -> Result<HashMap<String, String>> {
+-    let content = std::fs::read_to_string(path)
+-        .with_context(|| format!("read Temporal settings from {}", path.display()))?;
+-    temporal_trivia_shared::parse_env(&content)
+-        .with_context(|| format!("parse Temporal settings from {}", path.display()))
+-}
+-
+-fn required<'a>(settings: &'a HashMap<String, String>, name: &str) -> Result<&'a str> {
+-    let value = settings.get(name).map(String::as_str).unwrap_or("");
+-    if value.is_empty() {
+-        bail!("missing {name}; set it in the environment or .env.temporal");
+-    }
+-    Ok(value)
++    let profile = cloud::load_profile()?;
++    cloud::connect(&profile).await
+ }
+ 
+ #[cfg(test)]
