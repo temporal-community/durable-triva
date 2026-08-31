@@ -14,8 +14,10 @@ use temporalio_sdk::{
 
 use crate::model::{
     AnswerSpotlight, BADGE_TASK_QUEUE, BadgeAnswer, BadgeEvent, BadgeFailure, CHAOS_DURATION_MS,
-    ChaosCommand, EventKind, GAME_EXTENSION_MS, GameInput, GameSnapshot, GameStatus, PlayerScore,
-    PowerupNotice, Question, QuestionTask, Reassignment, RoundMemo,
+    ChaosCommand, EventKind, GAME_EXTENSION_MS, GameInput, GameSnapshot, GameStatus,
+    PHONE_TASK_QUEUE, PhoneActivityReady, PhoneAssignment, PhoneJoin, PhoneRosterSnapshot,
+    PhoneSessionSnapshot, PlayerKind, PlayerScore, PowerupNotice, Question, QuestionTask,
+    Reassignment, RoundMemo,
 };
 
 pub struct BadgeActivities;
@@ -33,10 +35,25 @@ impl BadgeActivities {
 pub struct GameWorkflow {
     snapshot: GameSnapshot,
     assignments: BTreeMap<String, BadgeEvent>,
+    phone_sessions: BTreeMap<String, PhoneSession>,
+    pending_phone_activities: BTreeMap<String, PhoneActivityReady>,
     retry_reasons: BTreeMap<String, String>,
     attempts_seen: BTreeSet<String>,
     questions: BTreeMap<String, Question>,
     index_search_attributes: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+struct PhoneSession {
+    callsign: String,
+    assignment: Option<PhoneAssignment>,
+    abandoned_questions: BTreeSet<String>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ActivityKind {
+    Badge,
+    Phone,
 }
 
 pub type GameWorkflowRun = <GameWorkflow as temporalio_common::HasWorkflowDefinition>::Run;
@@ -52,6 +69,8 @@ impl GameWorkflow {
         let deadline_unix_ms = started_unix_ms + input.duration_seconds * 1_000;
         ctx.state_mut(|state| {
             state.assignments.clear();
+            state.phone_sessions.clear();
+            state.pending_phone_activities.clear();
             state.retry_reasons.clear();
             state.attempts_seen.clear();
             state.questions = input
@@ -66,6 +85,7 @@ impl GameWorkflow {
                 status: GameStatus::Running,
                 started_unix_ms: Some(started_unix_ms),
                 deadline_unix_ms: Some(deadline_unix_ms),
+                detected_badge_count: input.detected_badge_count.unwrap_or_default() as u32,
                 ..Default::default()
             };
             state.snapshot.push_event("Round started".to_owned());
@@ -73,7 +93,11 @@ impl GameWorkflow {
                 let active_slots = input
                     .backlog_override
                     .unwrap_or_else(|| badge_count.saturating_sub(1).max(1));
-                if badge_count > 1 {
+                if badge_count == 0 {
+                    state
+                        .snapshot
+                        .push_event("Phone-only round ready · waiting for players".to_owned());
+                } else if badge_count > 1 {
                     state.snapshot.push_event(format!(
                         "{badge_count} badges ready · {active_slots} playing · 1 recovery reserve"
                     ));
@@ -90,12 +114,17 @@ impl GameWorkflow {
 
         type PendingResult = (
             Question,
+            ActivityKind,
             Result<BadgeAnswer, temporalio_sdk::ActivityExecutionError>,
         );
         let mut pending: FuturesUnordered<futures::future::LocalBoxFuture<'static, PendingResult>> =
             FuturesUnordered::new();
+        let question_template = input.questions.clone();
         let mut available: VecDeque<Question> = input.questions.into();
+        let mut deck_cycle = 1_u32;
         let activity_timeout = Duration::from_secs(input.duration_seconds + 35);
+        let mut pending_badges = 0_usize;
+        let mut pending_phones = 0_usize;
 
         loop {
             let now_unix_ms = workflow_unix_ms(ctx);
@@ -113,10 +142,29 @@ impl GameWorkflow {
                     .rust_only_until_unix_ms
                     .is_some_and(|until| until > now_unix_ms)
             });
-            let target = ctx.state(|state| state.snapshot.target_backlog(input.backlog_override));
-            while pending.len() < target {
+            let (badge_target, phone_target) =
+                ctx.state(|state| activity_targets(&state.snapshot, input.backlog_override));
+            while pending_badges < badge_target || pending_phones < phone_target {
+                if available.is_empty() && !question_template.is_empty() {
+                    deck_cycle = deck_cycle.saturating_add(1);
+                    available = refill_question_deck(&question_template, deck_cycle);
+                    ctx.state_mut(|state| {
+                        state.snapshot.push_event(format!(
+                            "Question deck exhausted; starting cycle {deck_cycle}"
+                        ))
+                    });
+                }
                 let Some(question) = take_next_question(&mut available, rust_only) else {
                     break;
+                };
+                let kind = if pending_phones < phone_target {
+                    ActivityKind::Phone
+                } else {
+                    ActivityKind::Badge
+                };
+                let task_queue = match kind {
+                    ActivityKind::Badge => BADGE_TASK_QUEUE,
+                    ActivityKind::Phone => PHONE_TASK_QUEUE,
                 };
                 let task = QuestionTask {
                     game_id: input.game_id.clone(),
@@ -149,15 +197,19 @@ impl GameWorkflow {
                                         }),
                                         ..Default::default()
                                     })
-                                    .task_queue(BADGE_TASK_QUEUE)
+                                    .task_queue(task_queue)
                                     .activity_id(question.id.clone())
                                     .build(),
                             )
                             .await;
-                        (question, result)
+                        (question, kind, result)
                     }
                     .boxed_local(),
                 );
+                match kind {
+                    ActivityKind::Badge => pending_badges += 1,
+                    ActivityKind::Phone => pending_phones += 1,
+                }
                 ctx.state_mut(|state| state.snapshot.scheduled_questions += 1);
             }
 
@@ -184,7 +236,11 @@ impl GameWorkflow {
             futures::select_biased! {
                 _ = tick => continue,
                 completed = pending.next().fuse() => {
-                    let Some((question, result)) = completed else { break };
+                    let Some((question, kind, result)) = completed else { break };
+                    match kind {
+                        ActivityKind::Badge => pending_badges = pending_badges.saturating_sub(1),
+                        ActivityKind::Phone => pending_phones = pending_phones.saturating_sub(1),
+                    }
                     match result {
                         Ok(answer) => {
                             let now_unix_ms = workflow_unix_ms(ctx);
@@ -222,48 +278,7 @@ impl GameWorkflow {
 
     #[signal]
     pub fn badge_started(&mut self, ctx: &mut SyncWorkflowContext<Self>, event: BadgeEvent) {
-        if let Some(previous) = self.assignments.get(&event.question_id)
-            && is_reassignment(previous, &event)
-        {
-            // Attempt is authoritative Temporal data. A failed Worker may be
-            // unable to send the best-effort panic Signal, so never require
-            // that Signal to recognize the retry.
-            let reason = self
-                .retry_reasons
-                .remove(&event.question_id)
-                .unwrap_or_else(|| "heartbeat timeout".to_owned());
-            let reassignment = Reassignment {
-                question_id: event.question_id.clone(),
-                from_callsign: previous.callsign.clone(),
-                to_callsign: event.callsign.clone(),
-                reason,
-                attempt: event.attempt,
-            };
-            self.snapshot.reassignments += 1;
-            self.snapshot.heartbeat_timeouts += 1;
-            self.snapshot.latest_reassignment = Some(reassignment.clone());
-            self.snapshot.push_kind(
-                EventKind::Handoff,
-                // The question id distinguishes two handoffs that otherwise
-                // read identically in the feed.
-                format!(
-                    "WORK REASSIGNED · {} · {} -> {} · ATTEMPT {} · {}",
-                    reassignment.question_id,
-                    reassignment.from_callsign,
-                    reassignment.to_callsign,
-                    reassignment.attempt,
-                    reassignment.reason
-                ),
-            );
-        }
-        self.assignments
-            .insert(event.question_id.clone(), event.clone());
-        if self
-            .attempts_seen
-            .insert(format!("{}:{}", event.question_id, event.attempt))
-        {
-            self.snapshot.activity_attempts += 1;
-        }
+        self.record_activity_started(event.clone());
         if !self.snapshot.players.contains_key(&event.badge_id) {
             self.snapshot.players.insert(
                 event.badge_id.clone(),
@@ -288,27 +303,7 @@ impl GameWorkflow {
 
     #[signal]
     pub fn panic_event(&mut self, _ctx: &mut SyncWorkflowContext<Self>, event: BadgeEvent) {
-        self.retry_reasons
-            .insert(event.question_id.clone(), "heartbeat timeout".to_owned());
-        self.snapshot.latest_failure = Some(BadgeFailure {
-            question_id: event.question_id.clone(),
-            callsign: event.callsign.clone(),
-            attempt: event.attempt,
-        });
-        let player = self
-            .snapshot
-            .players
-            .entry(event.badge_id.clone())
-            .or_insert_with(|| PlayerScore {
-                badge_id: event.badge_id,
-                callsign: event.callsign.clone(),
-                ..Default::default()
-            });
-        player.panics += 1;
-        self.snapshot.push_kind(
-            EventKind::Fault,
-            format!("{} crashed on {}", event.callsign, event.question_id),
-        );
+        self.record_panic(event);
     }
 
     #[signal]
@@ -317,6 +312,130 @@ impl GameWorkflow {
             EventKind::Handoff,
             format!("{} recovered; question returned", event.callsign),
         );
+    }
+
+    #[signal]
+    pub fn phone_joined(&mut self, _ctx: &mut SyncWorkflowContext<Self>, join: PhoneJoin) {
+        if self.snapshot.status != GameStatus::Running || join.session_id.is_empty() {
+            return;
+        }
+        let is_new = !self.phone_sessions.contains_key(&join.session_id);
+        self.phone_sessions
+            .entry(join.session_id.clone())
+            .or_insert_with(|| PhoneSession {
+                callsign: join.callsign.clone(),
+                ..Default::default()
+            });
+        if is_new {
+            self.snapshot.registered_phone_count = self.phone_sessions.len() as u32;
+            self.snapshot.players.insert(
+                join.session_id.clone(),
+                PlayerScore {
+                    badge_id: join.session_id,
+                    callsign: join.callsign.clone(),
+                    kind: PlayerKind::Phone,
+                    ..Default::default()
+                },
+            );
+            self.snapshot
+                .push_event(format!("{} joined by phone", join.callsign));
+        }
+        self.assign_waiting_phones();
+    }
+
+    #[signal]
+    pub fn phone_activity_ready(
+        &mut self,
+        _ctx: &mut SyncWorkflowContext<Self>,
+        ready: PhoneActivityReady,
+    ) {
+        if self.snapshot.status != GameStatus::Running {
+            return;
+        }
+        if let Some(previous) = self.assignments.get(&ready.activity_id)
+            && ready.attempt > previous.attempt
+            && let Some(session) = self.phone_sessions.get_mut(&previous.badge_id)
+        {
+            session
+                .abandoned_questions
+                .insert(ready.activity_id.clone());
+            if session
+                .assignment
+                .as_ref()
+                .is_some_and(|assignment| assignment.activity_id == ready.activity_id)
+            {
+                session.assignment = None;
+            }
+        }
+        self.clear_previous_phone_assignment(&ready.activity_id, ready.attempt);
+        self.pending_phone_activities
+            .insert(ready.activity_id.clone(), ready);
+        self.assign_waiting_phones();
+    }
+
+    #[signal]
+    pub fn phone_crashed(&mut self, _ctx: &mut SyncWorkflowContext<Self>, event: BadgeEvent) {
+        let accepted = self
+            .phone_sessions
+            .get_mut(&event.badge_id)
+            .is_some_and(|session| {
+                let matches = session.assignment.as_ref().is_some_and(|assignment| {
+                    assignment.activity_id == event.question_id
+                        && assignment.attempt == event.attempt
+                });
+                if matches {
+                    session
+                        .abandoned_questions
+                        .insert(event.question_id.clone());
+                }
+                matches
+            });
+        if !accepted {
+            return;
+        }
+        self.record_panic(event);
+    }
+
+    #[query]
+    pub fn phone_activity_owner(
+        &self,
+        _ctx: &WorkflowContextView,
+        activity_id: String,
+    ) -> Option<String> {
+        self.phone_sessions
+            .iter()
+            .find_map(|(session_id, session)| {
+                session
+                    .assignment
+                    .as_ref()
+                    .is_some_and(|assignment| assignment.activity_id == activity_id)
+                    .then(|| session_id.clone())
+            })
+    }
+
+    #[query]
+    pub fn phone_session(
+        &self,
+        _ctx: &WorkflowContextView,
+        session_id: String,
+    ) -> PhoneSessionSnapshot {
+        phone_session_snapshot(self, &session_id)
+    }
+
+    #[query]
+    pub fn phone_roster(&self, _ctx: &WorkflowContextView) -> PhoneRosterSnapshot {
+        PhoneRosterSnapshot {
+            game_id: self.snapshot.game_id.clone(),
+            status: self.snapshot.status.clone(),
+            deadline_unix_ms: self.snapshot.deadline_unix_ms,
+            winners: self.snapshot.winners.clone(),
+            latest_powerup: self.snapshot.chaos.latest_powerup.clone(),
+            sessions: self
+                .phone_sessions
+                .keys()
+                .map(|session_id| (session_id.clone(), phone_session_snapshot(self, session_id)))
+                .collect(),
+        }
     }
 
     #[update_validator(apply_chaos)]
@@ -429,6 +548,121 @@ impl GameWorkflow {
     }
 }
 
+impl GameWorkflow {
+    fn record_panic(&mut self, event: BadgeEvent) {
+        self.retry_reasons
+            .insert(event.question_id.clone(), "heartbeat timeout".to_owned());
+        self.snapshot.latest_failure = Some(BadgeFailure {
+            question_id: event.question_id.clone(),
+            callsign: event.callsign.clone(),
+            attempt: event.attempt,
+        });
+        let player = self
+            .snapshot
+            .players
+            .entry(event.badge_id.clone())
+            .or_insert_with(|| PlayerScore {
+                badge_id: event.badge_id,
+                callsign: event.callsign.clone(),
+                ..Default::default()
+            });
+        player.panics += 1;
+        self.snapshot.push_kind(
+            EventKind::Fault,
+            format!("{} crashed on {}", event.callsign, event.question_id),
+        );
+    }
+
+    fn clear_previous_phone_assignment(&mut self, activity_id: &str, attempt: u32) {
+        for session in self.phone_sessions.values_mut() {
+            if session.assignment.as_ref().is_some_and(|assignment| {
+                assignment.activity_id == activity_id && assignment.attempt < attempt
+            }) {
+                session.abandoned_questions.insert(activity_id.to_owned());
+                session.assignment = None;
+            }
+        }
+    }
+
+    fn assign_waiting_phones(&mut self) {
+        let activity_ids = self
+            .pending_phone_activities
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        for activity_id in activity_ids {
+            let Some(ready) = self.pending_phone_activities.get(&activity_id).cloned() else {
+                continue;
+            };
+            let Some(session_id) = self.phone_sessions.iter().find_map(|(id, session)| {
+                (session.assignment.is_none()
+                    && !session.abandoned_questions.contains(&activity_id))
+                .then(|| id.clone())
+            }) else {
+                continue;
+            };
+            let callsign = self.phone_sessions[&session_id].callsign.clone();
+            let assignment = PhoneAssignment {
+                activity_id: ready.activity_id.clone(),
+                workflow_run_id: ready.workflow_run_id,
+                attempt: ready.attempt,
+                task: ready.task,
+            };
+            self.phone_sessions
+                .get_mut(&session_id)
+                .expect("selected phone session exists")
+                .assignment = Some(assignment.clone());
+            self.pending_phone_activities.remove(&activity_id);
+            self.record_activity_started(BadgeEvent {
+                badge_id: session_id,
+                callsign,
+                question_id: assignment.activity_id,
+                attempt: assignment.attempt,
+            });
+        }
+    }
+
+    fn record_activity_started(&mut self, event: BadgeEvent) {
+        if let Some(previous) = self.assignments.get(&event.question_id)
+            && is_reassignment(previous, &event)
+        {
+            let reason = self
+                .retry_reasons
+                .remove(&event.question_id)
+                .unwrap_or_else(|| "heartbeat timeout".to_owned());
+            let reassignment = Reassignment {
+                question_id: event.question_id.clone(),
+                from_callsign: previous.callsign.clone(),
+                to_callsign: event.callsign.clone(),
+                reason,
+                attempt: event.attempt,
+            };
+            self.snapshot.reassignments += 1;
+            self.snapshot.heartbeat_timeouts += 1;
+            self.snapshot.latest_reassignment = Some(reassignment.clone());
+            self.snapshot.push_kind(
+                EventKind::Handoff,
+                format!(
+                    "WORK REASSIGNED · {} · {} -> {} · ATTEMPT {} · {}",
+                    reassignment.question_id,
+                    reassignment.from_callsign,
+                    reassignment.to_callsign,
+                    reassignment.attempt,
+                    reassignment.reason
+                ),
+            );
+        }
+        self.assignments
+            .insert(event.question_id.clone(), event.clone());
+        if self
+            .attempts_seen
+            .insert(format!("{}:{}", event.question_id, event.attempt))
+        {
+            self.snapshot.activity_attempts += 1;
+        }
+    }
+}
+
 fn record_answer(
     ctx: &mut WorkflowContext<GameWorkflow>,
     question: Question,
@@ -444,6 +678,14 @@ fn record_answer(
             return false;
         }
         let was_correct = answer.selected_index == question.correct_index;
+        if let Some(session) = state.phone_sessions.get_mut(&answer.badge_id)
+            && session
+                .assignment
+                .as_ref()
+                .is_some_and(|assignment| assignment.activity_id == question.id)
+        {
+            session.assignment = None;
+        }
         let points = active_points(&state.snapshot, now_unix_ms);
         let score = {
             let player = state
@@ -498,6 +740,55 @@ fn active_points(snapshot: &GameSnapshot, now_unix_ms: u64) -> i32 {
     }
 }
 
+fn activity_targets(snapshot: &GameSnapshot, override_value: Option<usize>) -> (usize, usize) {
+    let badges = snapshot.detected_badge_count as usize;
+    let phones = snapshot.registered_phone_count as usize;
+    let badge_target = override_value.unwrap_or_else(|| {
+        if badges == 0 {
+            0
+        } else {
+            badges.saturating_sub(1).max(1)
+        }
+    });
+    let phone_target = if badges == 0 {
+        // Bootstrap a phone-only round before the first browser can register.
+        // Once phones join, retain one global recovery slot.
+        phones.saturating_sub(1).max(1)
+    } else {
+        phones
+    };
+    (badge_target, phone_target)
+}
+
+fn phone_session_snapshot(state: &GameWorkflow, session_id: &str) -> PhoneSessionSnapshot {
+    let session = state.phone_sessions.get(session_id);
+    PhoneSessionSnapshot {
+        session_id: session_id.to_owned(),
+        callsign: session
+            .map(|value| value.callsign.clone())
+            .unwrap_or_default(),
+        game_id: state.snapshot.game_id.clone(),
+        status: state.snapshot.status.clone(),
+        deadline_unix_ms: state.snapshot.deadline_unix_ms,
+        assignment: session.and_then(|value| value.assignment.clone()),
+        player: state.snapshot.players.get(session_id).cloned(),
+        rank: player_rank(&state.snapshot, session_id),
+        winners: state.snapshot.winners.clone(),
+        latest_powerup: state.snapshot.chaos.latest_powerup.clone(),
+    }
+}
+
+fn player_rank(snapshot: &GameSnapshot, player_id: &str) -> Option<u32> {
+    let player = snapshot.players.get(player_id)?;
+    Some(
+        1 + snapshot
+            .players
+            .values()
+            .filter(|candidate| candidate.score > player.score)
+            .count() as u32,
+    )
+}
+
 fn is_reassignment(previous: &BadgeEvent, current: &BadgeEvent) -> bool {
     previous.badge_id != current.badge_id && current.attempt > previous.attempt
 }
@@ -540,6 +831,24 @@ fn take_next_question(available: &mut VecDeque<Question>, rust_only: bool) -> Op
     } else {
         available.pop_front()
     }
+}
+
+fn refill_question_deck(template: &[Question], cycle: u32) -> VecDeque<Question> {
+    let mut questions = template.to_vec();
+    if !questions.is_empty() {
+        let offset = cycle as usize * 97 % questions.len();
+        questions.rotate_left(offset);
+        if cycle.is_multiple_of(2) {
+            questions.reverse();
+        }
+    }
+    questions
+        .into_iter()
+        .map(|mut question| {
+            question.id = format!("{}-cycle-{cycle}", question.id);
+            question
+        })
+        .collect()
 }
 
 fn workflow_unix_ms(ctx: &WorkflowContext<GameWorkflow>) -> u64 {
@@ -615,6 +924,28 @@ mod tests {
         assert_eq!(
             available.front().map(|question| question.id.as_str()),
             Some("math-1")
+        );
+    }
+
+    #[test]
+    fn recycled_deck_waits_for_exhaustion_and_uses_unique_activity_ids() {
+        let template = [question("q-1", "rust"), question("q-2", "general")];
+        let recycled = refill_question_deck(&template, 2);
+        assert_eq!(recycled.len(), template.len());
+        assert!(
+            recycled
+                .iter()
+                .all(|question| question.id.ends_with("-cycle-2"))
+        );
+        assert_eq!(
+            recycled
+                .iter()
+                .map(|question| question.prompt.as_str())
+                .collect::<BTreeSet<_>>(),
+            template
+                .iter()
+                .map(|question| question.prompt.as_str())
+                .collect::<BTreeSet<_>>()
         );
     }
 

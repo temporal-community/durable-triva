@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+  <meta name="theme-color" content="#050706">
+  <title>Durable Trivia</title>
+  <style>
+    @font-face{font-family:"Space Grotesk";src:url('/assets/space-grotesk.ttf') format('truetype');font-style:normal;font-weight:300 700;font-display:swap}@font-face{font-family:"Space Mono";src:url('/assets/space-mono.ttf') format('truetype');font-style:normal;font-weight:400;font-display:swap}
+    :root{color-scheme:dark;--ink:#f5f3eb;--muted:#8b9096;--gold:#d5bb78;--trace:#3d3a2d;--panel:#0b0e0c;--fault:#d75f59;--ok:#83d7a2;--safe-top:max(18px,env(safe-area-inset-top));--safe-bottom:max(18px,env(safe-area-inset-bottom))}
+    *{box-sizing:border-box}html,body{height:100%;margin:0;overflow:hidden;background:#050706;color:var(--ink);font-family:"Space Grotesk",system-ui,sans-serif;font-synthesis:none}button{font:inherit;color:inherit}
+    body:before{content:"";position:fixed;inset:-15%;pointer-events:none;background:repeating-radial-gradient(circle at 85% 18%,transparent 0 78px,rgba(213,187,120,.12) 79px 80px,transparent 81px 118px),linear-gradient(115deg,transparent 0 68%,rgba(255,255,255,.025) 68.1% 68.3%,transparent 68.4%)}
+    main{position:relative;display:grid;grid-template-rows:auto minmax(0,1fr) auto;gap:14px;height:100%;max-width:640px;margin:auto;padding:var(--safe-top) 18px var(--safe-bottom)}
+    header{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:end;padding-bottom:12px;border-bottom:1px solid #303431}
+    .eyebrow,.meta,.category,.status,.crash-copy{font-family:"Space Mono",monospace;text-transform:uppercase;letter-spacing:.12em}.eyebrow{font-size:11px;color:var(--gold)}h1{font-size:clamp(20px,6vw,30px);line-height:1.05;margin:5px 0 0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.timer{font:700 clamp(38px,12vw,62px)/.85 "Space Grotesk";color:var(--ink);font-variant-numeric:tabular-nums}.meta{grid-column:1/-1;display:flex;gap:16px;margin-top:11px;color:var(--muted);font-size:11px}.meta b{color:var(--ink);font-weight:500}
+    .stage{min-height:0;display:grid;place-items:stretch}.screen{display:grid;grid-template-rows:auto minmax(88px,auto) minmax(0,1fr);gap:14px;width:100%;min-height:0}.screen[hidden]{display:none}.status{align-self:center;text-align:center;color:var(--muted);font-size:12px}.status strong{display:block;margin-top:8px;color:var(--gold);font:600 clamp(22px,7vw,36px)/1.1 "Space Grotesk";text-transform:none;letter-spacing:0}.question{display:flex;align-items:center;font-size:clamp(20px,5.7vw,31px);font-weight:600;line-height:1.18;overflow-wrap:anywhere}.category{color:var(--gold);font-size:10px;margin-bottom:7px}.answers{display:grid;grid-template-columns:1fr 1fr;gap:10px;min-height:0}.answer{position:relative;display:grid;grid-template-columns:31px 1fr;align-items:center;gap:9px;min-width:0;min-height:74px;padding:12px;border:1px solid #434842;border-radius:2px 18px 2px 18px;background:rgba(11,14,12,.9);text-align:left;touch-action:manipulation}.answer:active:not(:disabled){transform:translateY(2px);border-color:var(--gold);background:#151711}.answer:disabled{opacity:.48}.glyph{display:grid;place-items:center;width:28px;height:28px;border:1px solid var(--gold);border-radius:50%;color:var(--gold);font-size:13px}.answer span:last-child{min-width:0;font-size:clamp(13px,3.7vw,17px);line-height:1.15;overflow-wrap:anywhere}
+    footer{display:grid;gap:10px}.trace{height:1px;background:linear-gradient(90deg,var(--gold),var(--trace) 58%,transparent)}.crash{position:relative;isolation:isolate;height:54px;border:1px solid #51483a;border-radius:3px;background:transparent;overflow:hidden;touch-action:none}.crash:disabled{opacity:.35}.crash:before{content:"";position:absolute;z-index:-1;inset:0;right:auto;width:var(--hold,0%);background:var(--fault);transition:width .05s linear}.crash-copy{font-size:11px}.crash small{display:block;margin-top:3px;color:var(--muted);font:10px "Space Mono"}
+    .overlay{position:fixed;z-index:5;inset:0;display:grid;place-items:center;padding:26px;background:rgba(5,7,6,.96);text-align:center}.overlay[hidden]{display:none}.overlay img{width:min(48vw,210px);max-height:26vh}.overlay .eyebrow{margin-top:18px}.overlay h2{max-width:520px;margin:8px 0;font-size:clamp(30px,10vw,58px);line-height:.95}.overlay p{max-width:420px;color:var(--muted);line-height:1.45}.recovery-count{color:var(--fault);font:700 72px/1 "Space Grotesk";font-variant-numeric:tabular-nums}.powerup{background:rgba(213,187,120,.97);color:#070907}.powerup .eyebrow,.powerup p{color:#343125}
+    .feedback{position:fixed;z-index:4;left:50%;bottom:calc(var(--safe-bottom) + 72px);transform:translateX(-50%);padding:10px 15px;border:1px solid var(--gold);background:#090b09;font:11px "Space Mono";letter-spacing:.1em;text-transform:uppercase;white-space:nowrap}.feedback[hidden]{display:none}
+    @media (max-height:680px){main{gap:9px}.screen{gap:8px}.question{font-size:20px}.answer{min-height:62px;padding:9px}.crash{height:48px}}
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <div><div class="eyebrow">Durable Trivia Worker</div><h1 id="callsign">CONNECTING</h1></div>
+      <div class="timer" id="timer">--</div>
+      <div class="meta"><span>SCORE <b id="score">0</b></span><span>RANK <b id="rank">—</b></span><span id="record">0 OK · 0 RETRY</span></div>
+    </header>
+    <section class="stage" id="stage">
+      <div class="screen" id="waiting">
+        <div></div><div class="status">RUST WORKER STATUS<strong id="waiting-title">Looking for an active round</strong></div><div></div>
+      </div>
+      <div class="screen" id="playing" hidden>
+        <div><div class="category" id="category">QUESTION</div><div class="question" id="question"></div></div>
+        <div></div>
+        <div class="answers" id="answers"></div>
+      </div>
+      <div class="screen" id="finished" hidden>
+        <div></div><div class="status">ROUND COMPLETE<strong id="final-title">Workflow finished</strong><p id="final-copy"></p></div><div></div>
+      </div>
+    </section>
+    <footer><div class="trace"></div><button class="crash" id="crash" disabled><span class="crash-copy">Simulate Worker Crash</span><small>hold for 0.5 seconds</small></button></footer>
+  </main>
+  <div class="feedback" id="feedback" hidden>ANSWER SENT</div>
+  <div class="overlay" id="recovery" hidden><div><img src="/assets/astronaut.svg" alt=""><div class="eyebrow">Heartbeat timeout</div><h2>WORKER CRASHED</h2><div class="recovery-count" id="recovery-count">6</div><p>Temporal is returning this unfinished Activity to the Task Queue.</p></div></div>
+  <div class="overlay powerup" id="powerup" hidden><div><div class="eyebrow">Workflow Update</div><h2 id="powerup-title">POWERUP</h2><p>Durable state reached every active player.</p></div></div>
+  <script>
+    const $=id=>document.getElementById(id);let state=null,assignment=null,answering=false,crashing=false,holdTimer=null,holdStarted=0,lastPowerup=0,powerupTimer=null;
+    const glyphs=['▲','▶','◀','▼'];
+    async function api(path,body){const response=await fetch(path,{method:body?'POST':'GET',headers:body?{'content-type':'application/json'}:{},body:body?JSON.stringify(body):undefined,cache:'no-store'});if(!response.ok)throw new Error((await response.json().catch(()=>({}))).error||`HTTP ${response.status}`);return response.json()}
+    function assignmentBody(){return assignment&&{activity_id:assignment.activity_id,workflow_run_id:assignment.workflow_run_id,attempt:assignment.attempt}}
+    function secondsLeft(){return state?.deadline_unix_ms?Math.max(0,Math.ceil((state.deadline_unix_ms-Date.now())/1000)):null}
+    function renderTimer(){const n=secondsLeft();$('timer').textContent=n==null?'--':String(n).padStart(2,'0')}
+    function render(next){state=next;$('callsign').textContent=next.callsign;$('score').textContent=next.score;$('rank').textContent=next.rank??'—';$('record').textContent=`${next.correct} OK · ${next.wrong} RETRY`;
+      $('waiting').hidden=true;$('playing').hidden=true;$('finished').hidden=true;
+      if(next.status==='finished'){$('finished').hidden=false;assignment=null;$('crash').disabled=true;const won=next.winners.includes(next.callsign);$('final-title').textContent=won?'YOU WON':`RANK ${next.rank??'—'}`;$('final-copy').textContent=`Final score ${next.score}. ${next.winners.length?`Winner: ${next.winners.join(' + ')}`:'No answers completed.'}`}
+      else if(next.assignment){const changed=!assignment||assignment.activity_id!==next.assignment.activity_id||assignment.attempt!==next.assignment.attempt;assignment=next.assignment;if(changed)answering=false;$('playing').hidden=false;$('category').textContent=`${assignment.question.category} · attempt ${assignment.attempt}`;$('question').textContent=assignment.question.prompt;renderAnswers();$('crash').disabled=answering||crashing}
+      else{$('waiting').hidden=false;assignment=null;answering=false;$('crash').disabled=true;$('waiting-title').textContent=next.status==='running'?'Polling Temporal for work':'Scan stays connected for the next round'}
+      const notice=next.latest_powerup;if(notice&&notice.sequence>lastPowerup){lastPowerup=notice.sequence;showPowerup(notice.command)}renderTimer()}
+    function renderAnswers(){const box=$('answers');box.replaceChildren();assignment.question.answers.forEach((text,index)=>{const button=document.createElement('button');button.className='answer';button.disabled=answering||crashing;button.innerHTML=`<span class="glyph">${glyphs[index]}</span><span></span>`;button.lastElementChild.textContent=text;button.addEventListener('click',()=>answer(index));box.append(button)})}
+    async function answer(index){if(!assignment||answering||crashing)return;answering=true;renderAnswers();showFeedback('ANSWER SENT');const current=assignment;try{await api('/api/phone/answer',{activity_id:current.activity_id,workflow_run_id:current.workflow_run_id,attempt:current.attempt,selected_index:index})}catch(error){showFeedback(error.message);answering=false;renderAnswers()}pollSoon()}
+    function showFeedback(text){$('feedback').textContent=text;$('feedback').hidden=false;setTimeout(()=>$('feedback').hidden=true,1100)}
+    function showPowerup(command){clearTimeout(powerupTimer);$('powerup-title').textContent=command.replaceAll('_',' ').toUpperCase();$('powerup').hidden=false;if(navigator.vibrate)navigator.vibrate([90,45,90]);powerupTimer=setTimeout(()=>$('powerup').hidden=true,1500)}
+    function beginHold(event){if(!assignment||answering||crashing)return;event.preventDefault();holdStarted=performance.now();$('crash').style.setProperty('--hold','0%');holdTimer=setInterval(()=>{const pct=Math.min(100,(performance.now()-holdStarted)/5);$('crash').style.setProperty('--hold',`${pct}%`);if(pct>=100){cancelHold();simulateCrash()}},16)}
+    function cancelHold(){clearInterval(holdTimer);holdTimer=null;$('crash').style.setProperty('--hold','0%')}
+    async function simulateCrash(){if(!assignment||crashing)return;crashing=true;renderAnswers();$('crash').disabled=true;const crashed=assignment;try{await api('/api/phone/crash',{activity_id:crashed.activity_id,workflow_run_id:crashed.workflow_run_id,attempt:crashed.attempt});$('recovery').hidden=false;const until=Date.now()+6000;const countdown=setInterval(()=>{$('recovery-count').textContent=Math.max(0,Math.ceil((until-Date.now())/1000))},100);setTimeout(async()=>{clearInterval(countdown);$('recovery').hidden=true;crashing=false;await api('/api/phone/recovered',{activity_id:crashed.activity_id,workflow_run_id:crashed.workflow_run_id,attempt:crashed.attempt}).catch(()=>{});pollSoon()},6000)}catch(error){crashing=false;showFeedback(error.message);renderAnswers()}}
+    $('crash').addEventListener('pointerdown',beginHold);for(const event of ['pointerup','pointercancel','pointerleave'])$('crash').addEventListener(event,cancelHold);
+    async function poll(){try{render(await api('/api/phone/state'))}catch(error){$('waiting-title').textContent='Reconnecting to Temporal'}setTimeout(poll,1000)}function pollSoon(){setTimeout(()=>{},0)}
+    setInterval(()=>{const body=assignmentBody();if(body&&!crashing&&!answering)api('/api/phone/heartbeat',body).catch(()=>{})},1000);setInterval(renderTimer,200);poll();
+  </script>
+</body>
+</html>

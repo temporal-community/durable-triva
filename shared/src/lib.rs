@@ -7,6 +7,7 @@ use std::{
 use serde::{Deserialize, Deserializer, Serialize, de};
 
 pub const BADGE_TASK_QUEUE: &str = "temporal-trivia-badges-v1";
+pub const PHONE_TASK_QUEUE: &str = "temporal-trivia-phones-v1";
 // Workflow and Activity Workers share one logical Task Queue so Temporal UI's
 // Workflow Workers tab can show the Mac controller and physical badges
 // together. WorkerTaskTypes still prevents either process from accepting the
@@ -250,10 +251,66 @@ pub struct GameInput {
 pub struct PlayerScore {
     pub badge_id: String,
     pub callsign: String,
+    #[serde(default)]
+    pub kind: PlayerKind,
     pub score: i32,
     pub correct: u32,
     pub wrong: u32,
     pub panics: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PlayerKind {
+    #[default]
+    Badge,
+    Phone,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PhoneJoin {
+    pub session_id: String,
+    pub callsign: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PhoneActivityReady {
+    pub activity_id: String,
+    pub workflow_run_id: String,
+    pub attempt: u32,
+    pub task: QuestionTask,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PhoneAssignment {
+    pub activity_id: String,
+    pub workflow_run_id: String,
+    pub attempt: u32,
+    pub task: QuestionTask,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PhoneSessionSnapshot {
+    pub session_id: String,
+    pub callsign: String,
+    pub game_id: Option<String>,
+    pub status: GameStatus,
+    pub deadline_unix_ms: Option<u64>,
+    pub assignment: Option<PhoneAssignment>,
+    pub player: Option<PlayerScore>,
+    pub rank: Option<u32>,
+    pub winners: Vec<String>,
+    pub latest_powerup: Option<PowerupNotice>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PhoneRosterSnapshot {
+    pub game_id: Option<String>,
+    pub status: GameStatus,
+    pub deadline_unix_ms: Option<u64>,
+    pub winners: Vec<String>,
+    pub latest_powerup: Option<PowerupNotice>,
+    pub sessions: BTreeMap<String, PhoneSessionSnapshot>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -315,6 +372,10 @@ pub struct GameSnapshot {
     pub completed_questions: u32,
     pub scheduled_questions: u32,
     pub players: BTreeMap<String, PlayerScore>,
+    #[serde(default)]
+    pub registered_phone_count: u32,
+    #[serde(default)]
+    pub detected_badge_count: u32,
     pub latest_answer: Option<AnswerSpotlight>,
     pub events: Vec<GameEvent>,
     pub winners: Vec<String>,
@@ -356,7 +417,11 @@ impl GameSnapshot {
     }
 
     pub fn target_backlog(&self, override_value: Option<usize>) -> usize {
-        override_value.unwrap_or_else(|| 10.max(self.players.len() * 2))
+        override_value.unwrap_or_else(|| {
+            let participants =
+                self.detected_badge_count as usize + self.registered_phone_count as usize;
+            participants.saturating_sub(1).max(1)
+        })
     }
 
     pub fn finish(&mut self) {
@@ -401,20 +466,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn backlog_scales_from_ten() {
+    fn backlog_reserves_one_participant_for_recovery() {
         let mut state = GameSnapshot::default();
-        assert_eq!(state.target_backlog(None), 10);
-        for index in 0..8 {
-            state.players.insert(
-                index.to_string(),
-                PlayerScore {
-                    badge_id: index.to_string(),
-                    callsign: format!("BADGE-{index}"),
-                    ..Default::default()
-                },
-            );
-        }
-        assert_eq!(state.target_backlog(None), 16);
+        assert_eq!(state.target_backlog(None), 1);
+        state.detected_badge_count = 10;
+        assert_eq!(state.target_backlog(None), 9);
+        state.registered_phone_count = 100;
+        assert_eq!(state.target_backlog(None), 109);
         assert_eq!(state.target_backlog(Some(33)), 33);
     }
 

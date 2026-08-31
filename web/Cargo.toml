@@ -11,6 +11,8 @@ futures = "0.3"
 html-escape = "0.2"
 prost-wkt-types = "0.7"
 rand = "0.9"
+qrcode = { version = "0.14.1", default-features = false, features = ["svg"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
@@ -28,6 +30,10 @@ uuid = { version = "1", features = ["v4"] }
 [[bin]]
 name = "simulate-badges"
 path = "src/bin/simulate_badges.rs"
+
+[[bin]]
+name = "simulate-phones"
+path = "src/bin/simulate_phones.rs"
 
 [dev-dependencies]
 # The deck has to be renderable on the badge, not just on the TV.

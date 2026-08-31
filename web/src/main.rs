@@ -20,6 +20,7 @@ use axum::{
     routing::{get, post},
 };
 use futures::{Stream, StreamExt};
+use qrcode::{QrCode, render::svg};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use temporalio_client::{
@@ -115,6 +116,11 @@ struct WorkflowDetails {
     temporal_ui_url: String,
 }
 
+#[derive(Debug, Serialize)]
+struct PhoneConfig {
+    url: String,
+}
+
 #[derive(Debug)]
 struct ApiError(StatusCode, String);
 
@@ -164,7 +170,9 @@ async fn main() -> Result<()> {
             .route("/assets/astronaut.svg", get(astronaut_asset))
             .route("/assets/space-grotesk.ttf", get(space_grotesk_asset))
             .route("/assets/space-mono.ttf", get(space_mono_asset))
+            .route("/assets/phone-qr.svg", get(phone_qr_asset))
             .route("/api/state", get(current_state))
+            .route("/api/phone-config", get(phone_config))
             .route("/api/recovery", get(recovery_proof))
             .route("/api/workflow", get(workflow_details))
             .route("/api/events", get(event_stream))
@@ -219,6 +227,31 @@ async fn space_grotesk_asset() -> Response {
 
 async fn space_mono_asset() -> Response {
     asset("font/ttf", SPACE_MONO_TTF)
+}
+
+async fn phone_qr_asset() -> Result<Response, ApiError> {
+    let url = phone_public_url();
+    let code = QrCode::new(url.as_bytes())
+        .map_err(|error| ApiError(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let body = code.render::<svg::Color>().quiet_zone(true).build();
+    Ok((
+        [
+            (header::CONTENT_TYPE, "image/svg+xml"),
+            (header::CACHE_CONTROL, ASSET_CACHE_CONTROL),
+        ],
+        body,
+    )
+        .into_response())
+}
+
+async fn phone_config() -> Json<PhoneConfig> {
+    Json(PhoneConfig {
+        url: phone_public_url(),
+    })
+}
+
+fn phone_public_url() -> String {
+    std::env::var("PUBLIC_BASE_URL").unwrap_or_else(|_| "http://127.0.0.1:8080".to_owned())
 }
 
 async fn current_state(State(state): State<AppState>) -> Json<GameSnapshot> {
@@ -297,16 +330,6 @@ async fn start_game(
     let detected_badge_count = active_badge_count(&state.client)
         .await
         .map_err(|error| ApiError(StatusCode::BAD_GATEWAY, error.to_string()))?;
-    if detected_badge_count == 0 {
-        return Err(ApiError(
-            StatusCode::CONFLICT,
-            "no active badge Workers detected; power on a badge and wait for its Worker screen"
-                .to_owned(),
-        ));
-    }
-    let target_backlog = request
-        .backlog_override
-        .unwrap_or_else(|| recovery_capacity(detected_badge_count));
     let deck = questions::build_deck(rand::random(), 500)
         .map_err(|error| ApiError(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let game_id = format!("trivia-{}", Uuid::new_v4().simple());
@@ -327,7 +350,7 @@ async fn start_game(
         game_id: game_id.clone(),
         questions: deck,
         duration_seconds: GAME_SECONDS,
-        backlog_override: Some(target_backlog),
+        backlog_override: request.backlog_override,
         detected_badge_count: Some(detected_badge_count),
         index_search_attributes: std::env::var("TRIVIA_SEARCH_ATTRIBUTES").as_deref() == Ok("1"),
     };
@@ -356,6 +379,7 @@ async fn start_game(
     let starting = GameSnapshot {
         game_id: Some(game_id.clone()),
         status: GameStatus::Running,
+        detected_badge_count: detected_badge_count as u32,
         ..Default::default()
     };
     publish(&state, starting.clone()).await;
@@ -398,10 +422,6 @@ async fn active_badge_count(client: &Client) -> Result<usize> {
         .map(|poller| poller.identity)
         .collect::<HashSet<_>>()
         .len())
-}
-
-fn recovery_capacity(badge_count: usize) -> usize {
-    badge_count.saturating_sub(1).max(1)
 }
 
 fn is_badge_worker_identity(identity: &str) -> bool {
@@ -719,14 +739,6 @@ mod tests {
             snapshot_digest(&changed),
             snapshot_digest(&GameSnapshot::default())
         );
-    }
-
-    #[test]
-    fn recovery_capacity_reserves_one_badge_when_possible() {
-        assert_eq!(recovery_capacity(0), 1);
-        assert_eq!(recovery_capacity(1), 1);
-        assert_eq!(recovery_capacity(2), 1);
-        assert_eq!(recovery_capacity(10), 9);
     }
 
     #[test]

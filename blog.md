@@ -1,5 +1,85 @@
 # Engineering journal
 
+## 2026-08-30 — Phone-player architecture locked
+
+- Chose one mixed game rather than a separate crowd mode: physical badges and
+  phones share the same 60-second Workflow, score table, question deck, chaos
+  controls, and retry semantics. Late phone joins start at zero.
+- Rejected treating browsers as Temporal Workers. A Rust Activity Worker on a
+  GCP Cloud Run Worker Pool will dispatch real Activities to phones using
+  asynchronous Activity completion. The phone API and UI are a separate
+  stateless Cloud Run service; the Mac remains the Workflow Worker, operator
+  server, and TV scoreboard.
+- Rejected DynamoDB and Firestore for the first release. A long-lived cookie
+  holds only an anonymous badge-style identity. The Game Workflow owns phone
+  registration, assignment, scores, abandoned questions, and retry state.
+- Locked one outstanding Activity per phone session. The phone heartbeats its
+  async Activity through the API. Holding SIMULATE CRASH for 500 ms suppresses
+  heartbeats for six seconds so the existing five-second heartbeat timeout
+  produces a real Temporal retry; the phone cannot reclaim that question.
+- The TV will show a Cloud Run URL as a QR code. The public service embeds the
+  portrait phone UI and exposes the phone API from one binary. No TV hosting,
+  identity service, or external database is added.
+- The initial load target is 100 phones, ten simulated badge Workers, and two
+  physical badges for three consecutive rounds. Phone simulation uses seeded
+  1–10 second answer delays, 80% correct answers, 20% wrong answers, and 5%
+  real crash timing.
+- GCP Worker Versioning remains a planned stage beat, but was explicitly
+  deferred until the basic phone path works. The eventual v2 deployment will
+  be triggered from a mirrored terminal command, with a visible recovery UI
+  change and identical scoring/timing.
+
+## 2026-08-30 — First 100-phone Temporal Cloud validation
+
+- Implemented the phone UI/API, Rust Activity dispatcher, async Activity
+  completion, cookie callsigns, TV QR, 500 ms crash hold, six-second blackout,
+  deterministic deck recycling, and a seeded 100-session simulator with 1–10
+  second answer delays and intentionally wrong answers.
+- The first load attempts exposed two authentic scaling failures. Repeatedly
+  signaling `phone_joined` on every browser poll bloated Workflow traffic, and
+  querying assignment ownership from every heartbeat plus every dispatcher
+  Activity filled Temporal's consistent-query buffer. The exact Cloud error
+  was `Some resource has been exhausted: consistent query buffer is full`.
+- Removed per-phone and per-Activity query fan-out. The API now refreshes one
+  disposable roster cache from a batched Workflow query every 250 ms, while
+  heartbeats and answers use the async Activity identifier directly. The
+  dispatcher heartbeats once, signals durable readiness, and immediately
+  returns `WillCompleteAsync` rather than polling a query until assignment.
+- Final live round `trivia-4b4c8989a2544876921410795767d40a` completed 100
+  simulated sessions: 377 accepted answers and 26 deliberate crashes. The
+  Workflow recorded 327 completed questions, 264 correct, 63 wrong, 28
+  heartbeat timeouts, 28 reassignments, and 455 Activity attempts. One manually
+  open phone was also registered but idle, accounting for the two timeouts
+  beyond the simulator's 26 crashes.
+- All 17 host tests pass after the changes. Cloud Run deployment and the
+  terminal-triggered Worker Versioning beat remain unvalidated follow-up work;
+  this session proved the local Rust processes against Temporal Cloud, not a
+  deployed GCP service.
+- Added one production container containing both phone binaries plus documented
+  Cloud Run service and Worker Pool commands. Local image validation could not
+  start because Docker Desktop was not running: `failed to connect to the
+  docker API at unix:///Users/shy/.docker/run/docker.sock`. The Dockerfile and
+  GCP deployment are therefore prepared but not yet build-validated.
+- Corrected the phone client's font registration after a live screenshot showed
+  mismatched heavy question text. The Space Grotesk asset is a variable font,
+  but its `@font-face` had been registered only as normal weight, causing the
+  browser to synthesize the requested 600 and 700 weights. Declared its real
+  300–700 range, declared Space Mono at 400, replaced leftover unregistered
+  family aliases, and disabled synthetic font styles. A real live question at
+  390×844 loaded both bundled faces at the intended weights with no overflow.
+
+## 2026-08-31 — Badge-first attract screen restored
+
+- Restored the original astronaut tardigrade artwork and the original
+  badge-focused three-part attract story. Removed the always-visible header QR
+  so the default booth state speaks clearly about physical Rust Workers.
+- Added a secondary `Show phone QR` control beside Start Round. It swaps the
+  artwork in place for the large QR and becomes `Show badge art`; entering a
+  new intermission always resets to badge art.
+- Browser-validated both views in the live controller. Artwork/QR visibility,
+  button state, and ARIA pressed state all switch together, neither view
+  overflows, and the controller was left in badge mode.
+
 ## 2026-08-17 — First playable Temporal trivia build
 
 - Created a standalone Git repository with two product folders: `firmware/`

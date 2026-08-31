@@ -1,0 +1,10 @@
+.git
+.cargo-home
+.embuild
+.env
+.env.*
+!.env*.example
+.tools
+target
+firmware/sdkconfig
+firmware/sdkconfig.old

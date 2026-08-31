@@ -214,6 +214,7 @@
       align-items: center;
       gap: 1.4cqw;
       color: var(--silk-dim);
+      padding-right: 4.6cqw;
     }
     :is(.brand h1, .clock, .meter-row) { align-self: baseline; }
     .meter::before {
@@ -643,7 +644,14 @@
     .stage:is(.waiting, .intermission) .attract { display: grid; }
     .stage.tray-open .attract { bottom: 20cqh; }
     .stage.tray-open.tray-tall .attract { bottom: 36cqh; }
-    .attract-art { justify-self: center; width: 92%; height: auto; max-height: 60cqh; object-fit: contain; }
+    .attract-visual { justify-self: stretch; display: grid; place-items: center; min-width: 0; min-height: 0; }
+    .attract-art { grid-area: 1 / 1; width: 92%; height: auto; max-height: 60cqh; object-fit: contain; }
+    .join-block { justify-self: center; display: grid; justify-items: center; gap: 1.4cqh; }
+    .join-block[hidden], .attract-art[hidden] { display: none; }
+    .join-qr { width: min(25cqw, 38cqh); aspect-ratio: 1; padding: .7cqw; background: var(--silk); border-radius: .4cqw; }
+    .join-label { color: var(--gold); letter-spacing: .14em; text-align: center; }
+    .join-url { max-width: 27cqw; color: var(--silk-dim); font-size: 1.5cqh; letter-spacing: .04em; overflow-wrap: anywhere; text-align: center; }
+    .kind-icon { margin-right: .55em; color: var(--gold); font-size: .7em; vertical-align: .12em; }
     .attract-copy { min-width: 0; }
     .attract-kicker {
       display: block;
@@ -750,6 +758,28 @@
     .start::before { left: 1.3cqw; }
     .start::after { right: 1.3cqw; }
     .start:disabled { opacity: .45; cursor: progress; }
+    .attract-actions {
+      display: flex;
+      align-items: center;
+      gap: 1.4cqw;
+      margin-top: 3.2cqh;
+    }
+    .attract-actions .start { margin-top: 0; }
+    .show-qr {
+      min-width: 15cqw;
+      height: 6.6cqh;
+      padding: 0 1.6cqw;
+      border: var(--hairline) solid var(--gold);
+      border-radius: var(--pill-radius);
+      color: var(--gold);
+      background: rgba(5, 7, 6, .76);
+      font-family: var(--font-mono);
+      font-size: var(--floor);
+      letter-spacing: .12em;
+      text-transform: uppercase;
+      cursor: pointer;
+    }
+    .show-qr:hover, .show-qr[aria-pressed="true"] { color: var(--substrate-deep); background: var(--gold); }
     .restart {
       position: absolute;
       z-index: 4;
@@ -928,7 +958,6 @@
     </header>
 
     <div class="fault-strip" id="faultStrip" role="status" aria-live="polite"></div>
-
     <main class="board">
       <section class="lanes" id="lanes" aria-label="Badge race"></section>
       <aside class="rail" aria-label="Round detail">
@@ -972,7 +1001,14 @@
     </main>
 
     <section class="attract" id="attract" aria-label="Waiting for badges">
-      <img class="attract-art" alt="" src="/assets/astronaut.svg" aria-hidden="true">
+      <div class="attract-visual">
+        <img class="attract-art" id="attractArt" alt="" src="/assets/astronaut.svg" aria-hidden="true">
+        <div class="join-block" id="phoneJoin" hidden>
+          <img class="join-qr" src="/assets/phone-qr.svg" alt="Scan to join Durable Trivia on your phone">
+          <span class="join-label">Scan to join</span>
+          <span class="join-url" id="joinUrl">Loading phone URL</span>
+        </div>
+      </div>
       <div class="attract-copy">
         <span class="attract-kicker" id="attractKicker">How it works · 01/03</span>
         <h2 class="attract-head" id="attractHead">Every badge is a Rust Worker</h2>
@@ -981,7 +1017,10 @@
         <span class="last-round" id="lastRound" hidden></span>
         <span class="roster-label" id="rosterLabel">Waiting for the first Worker</span>
         <div class="roster" id="roster"></div>
-        <button class="start" id="start" type="button">Start 60 sec round</button>
+        <div class="attract-actions">
+          <button class="start" id="start" type="button">Start 60 sec round</button>
+          <button class="show-qr" id="showPhoneQr" type="button" aria-pressed="false">Show phone QR</button>
+        </div>
       </div>
     </section>
 
@@ -1230,7 +1269,7 @@
       lane.dataset.badgeId = badgeId;
       lane.innerHTML =
         '<span class="rank"></span>' +
-        '<span class="name-row"><span class="callsign"></span></span>' +
+        '<span class="name-row"><span class="kind-icon"></span><span class="callsign"></span></span>' +
         '<span class="bar"><span class="routed"></span></span>' +
         '<span class="state"></span>' +
         '<strong class="score">0</strong>';
@@ -1322,6 +1361,7 @@
           ? (winners.size > 1 ? 'Tied' : 'Winner')
           : String(ranks.get(player.badge_id) ?? 0).padStart(2, '0');
         lane.querySelector('.callsign').textContent = player.callsign;
+        lane.querySelector('.kind-icon').textContent = player.kind === 'phone' ? '' : '▣';
         lane.classList.toggle('column-start', index === 0 || (twoColumns && index === rows));
         lane.classList.toggle('win', isWinner);
         lane.querySelector('.plate')?.remove();
@@ -1434,7 +1474,7 @@
       const count = players.length;
       el('rosterLabel').textContent = count
         ? count + (count === 1 ? ' Worker seen' : ' Workers seen') + ' · join anytime'
-        : 'Power on a badge to join the Task Queue';
+        : 'Power on a badge to join';
       el('roster').replaceChildren(...players.map(player => {
         const chip = document.createElement('span');
         chip.className = 'roster-chip';
@@ -1855,17 +1895,28 @@
       }
     }
 
+    function setPhoneJoinVisible(visible) {
+      el('attractArt').hidden = visible;
+      el('phoneJoin').hidden = !visible;
+      el('showPhoneQr').setAttribute('aria-pressed', String(visible));
+      el('showPhoneQr').textContent = visible ? 'Show badge art' : 'Show phone QR';
+    }
+
     function enterIntermission() {
       clearPostRoundTimer();
       intermissionMode = true;
       attractStoryIndex = -1;
       attractStoryStartedAt = Date.now();
+      setPhoneJoinVisible(false);
       closeTray();
       render(state);
       paintAttractStory(true);
     }
 
     el('start').addEventListener('click', event => startRound(event.currentTarget));
+    el('showPhoneQr').addEventListener('click', () => {
+      setPhoneJoinVisible(el('showPhoneQr').getAttribute('aria-pressed') !== 'true');
+    });
     el('restart').addEventListener('click', enterIntermission);
 
     document.querySelectorAll('[data-chaos]').forEach(button => {
@@ -1987,6 +2038,10 @@
         showError(error.message);
         connectEvents();
       });
+    fetch('/api/phone-config', {cache: 'no-store'})
+      .then(response => response.json())
+      .then(config => { el('joinUrl').textContent = config.url; })
+      .catch(() => { el('joinUrl').textContent = 'Phone service unavailable'; });
     tick();
     setInterval(tick, 100);
   </script>

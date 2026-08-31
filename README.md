@@ -1,9 +1,10 @@
 # Durable Trivia
 
 Durable Trivia is a 60-second competitive game where Temporal Replay 2026
-badges are real Rust Temporal Activity Workers. A Rust/Axum controller runs the
-Workflow Worker and a 16:9 scoreboard on a laptop; Temporal Cloud coordinates
-questions, retries unfinished work, and preserves the round through crashes.
+badges and phone players share real Rust Temporal Activities. A Rust/Axum
+controller runs the Workflow Worker and a 16:9 scoreboard on a laptop; Temporal
+Cloud coordinates questions, retries unfinished work, and preserves the round
+through crashes.
 Both the controller and badge firmware currently pin Temporal Rust SDK `0.7.0`.
 
 ## Start here
@@ -22,7 +23,8 @@ both running for a physical game.
   [Temporal Replay 2026 Badge](https://badge.temporal.io/), including its OLED
   UI, button input, deterministic identity, and NVS session state.
 - `web/` contains the Rust Workflow Worker, Axum operator server, 16:9
-  scoreboard, and bundled trivia deck.
+  scoreboard, phone UI/API, serverless phone Activity Worker, load simulator,
+  and bundled trivia deck.
 - `shared/` contains the serialized game contract used by both Workers so their
   Temporal payloads cannot drift independently.
 
@@ -112,3 +114,33 @@ The most recent physical validation covered build, flash, boot, Wi-Fi,
 Temporal Cloud polling, answers, sleep/wake, supervised Mac Worker recovery,
 and a real heartbeat timeout moving the same Activity from
 `KEEN-SEAL-70` attempt 1 to `KEEN-RAVEN-C8` attempt 2.
+
+## Run phone players locally
+
+Use three terminals after starting the Mac controller:
+
+```sh
+# Terminal 1: TV/controller, with a QR that points at the phone API
+PUBLIC_BASE_URL=http://127.0.0.1:8080 ./run-web.sh
+
+# Terminal 2: phone web UI and API
+./run-phone-api.sh
+
+# Terminal 3: Rust Activity Worker for phone assignments
+./run-phone-worker.sh
+```
+
+Open <http://127.0.0.1:8080> on a phone or another browser. The API gives the
+browser a stable anonymous callsign cookie. It does not send the correct answer
+to the browser. Each session owns at most one real Temporal Activity.
+
+For a 100-phone load test, restart the phone API with its test-only answer key
+enabled, start a round, and run the simulator:
+
+```sh
+PHONE_SIMULATION=1 ./run-phone-api.sh
+./simulate-phones.sh 100
+```
+
+The test-only flag adds the correct answer index to the simulator payload. Do
+not set it on the public Cloud Run service.

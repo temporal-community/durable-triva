@@ -1,9 +1,10 @@
 # Web controller and scoreboard
 
 This directory contains the Rust Temporal Workflow Worker, Axum operator
-server, trivia deck, and fixed 16:9 scoreboard. The controller starts rounds,
-schedules question Activities for Replay 2026 badges, observes durable game
-state, and serves the operator UI at `127.0.0.1:3000`.
+server, trivia deck, fixed 16:9 scoreboard, phone UI/API, and serverless phone
+Activity Worker. The controller starts rounds, schedules question Activities
+for badges and phones, observes durable game state, and serves the operator UI
+at `127.0.0.1:3000`.
 
 The controller polls Workflow Tasks on the same
 `temporal-trivia-badges-v1` Task Queue used by badge Activity Workers. Each
@@ -110,3 +111,59 @@ Signals, retry scheduling, and shared payload validation.
 
 See the root [game specification](../GAME_SPEC.md) for scoring and retry rules
 and the [engineering journal](../blog.md) for live recovery validation.
+
+## Phone players
+
+The public phone path has two Rust processes:
+
+- `phone_api` serves the portrait UI and turns browser heartbeats and answers
+  into asynchronous Activity heartbeats/completions.
+- `phone_worker` polls `temporal-trivia-phones-v1`, signals the durable
+  assignment into the Game Workflow, then returns `WillCompleteAsync`.
+
+The API refreshes all phone assignments with one batched Workflow query every
+250 ms. Individual browser polls read that disposable cache, while the Game
+Workflow remains the source of truth. Restarting the API repopulates the cache
+from Temporal; no database is required.
+
+Run both processes from the repository root:
+
+```sh
+./run-phone-api.sh
+./run-phone-worker.sh
+```
+
+Set `PUBLIC_BASE_URL` when starting the controller so the TV QR targets the
+public phone service. Production HTTPS uses a Secure cookie by default; the
+local launcher sets `PHONE_COOKIE_SECURE=0` for HTTP localhost.
+
+The eventual Worker Versioning demo is deliberately deferred. It will be a
+terminal-triggered deployment step, not an operator UI control, after the
+basic Cloud Run deployment is validated.
+
+## Cloud Run container
+
+The root `Dockerfile` builds both Rust binaries. Its default command runs the
+public API; deploy the same immutable image to a Worker Pool with the command
+overridden to `/usr/local/bin/phone_worker`.
+
+```sh
+gcloud builds submit --tag REGION-docker.pkg.dev/PROJECT/REPOSITORY/durable-trivia-phone .
+
+gcloud run deploy durable-trivia-phone \
+  --image REGION-docker.pkg.dev/PROJECT/REPOSITORY/durable-trivia-phone \
+  --region REGION --allow-unauthenticated \
+  --set-env-vars TEMPORAL_ADDRESS=ADDRESS,TEMPORAL_NAMESPACE=NAMESPACE \
+  --set-secrets TEMPORAL_API_KEY=temporal-api-key:latest
+
+gcloud run worker-pools deploy durable-trivia-phone-worker \
+  --image REGION-docker.pkg.dev/PROJECT/REPOSITORY/durable-trivia-phone \
+  --region REGION --instances 1 --command /usr/local/bin/phone_worker \
+  --set-env-vars TEMPORAL_ADDRESS=ADDRESS,TEMPORAL_NAMESPACE=NAMESPACE \
+  --set-secrets TEMPORAL_API_KEY=temporal-api-key:latest
+```
+
+Cloud Run Worker Pools use a fixed instance count rather than request-driven
+autoscaling. Keep one warm instance for the stage and booth demo. Put the
+Temporal API key in Secret Manager rather than a checked-in env file or shell
+history.
