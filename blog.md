@@ -80,6 +80,26 @@
   button state, and ARIA pressed state all switch together, neither view
   overflows, and the controller was left in badge mode.
 
+## 2026-08-31 — Root README reorganized around the demo story
+
+- Reformatted the root README to follow Durable Wordle's documentation shape:
+  a direct demo pitch, a Temporal concepts table, a Mermaid architecture map,
+  fast runnable paths, deployment guidance, development gates, and a concise
+  tech-stack summary.
+- Kept Durable Trivia's badge, phone, simulator, Cloud Run, and operator details
+  rather than copying Durable Wordle's Python-specific instructions. The deeper
+  firmware and web guides remain the source for component setup.
+
+## 2026-08-31 — Root README reduced to an entry point
+
+- Follow-up review found that the first README pass still duplicated the
+  component guides and was too dense for a new reader. Reduced it to the demo
+  pitch, Temporal concepts, architecture, a three-step simulated-badge start,
+  project layout, and a documentation map.
+- Detailed firmware, controller, phone, Cloud Run, operator, verification, and
+  game-rule material now lives behind direct links to `firmware/README.md`,
+  `web/README.md`, and `GAME_SPEC.md` instead of being repeated at the root.
+
 ## 2026-08-17 — First playable Temporal trivia build
 
 - Created a standalone Git repository with two product folders: `firmware/`

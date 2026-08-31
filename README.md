@@ -1,146 +1,95 @@
 # Durable Trivia
 
-Durable Trivia is a 60-second competitive game where Temporal Replay 2026
-badges and phone players share real Rust Temporal Activities. A Rust/Axum
-controller runs the Workflow Worker and a 16:9 scoreboard on a laptop; Temporal
-Cloud coordinates questions, retries unfinished work, and preserves the round
-through crashes.
-Both the controller and badge firmware currently pin Temporal Rust SDK `0.7.0`.
+A 60-second competitive trivia game where Temporal Replay 2026 badges and
+phone players race to complete real Rust [Temporal](https://temporal.io)
+Activities. The badges are Workers, the questions are Activities, and the game
+survives when a player deliberately crashes one.
 
-## Start here
+A Rust/Axum controller runs the Workflow Worker and a 16:9 scoreboard on a
+laptop. Temporal Cloud coordinates questions, retries unfinished work, and
+preserves the round through Worker failures. Physical badges, simulated badges,
+and browser-based phone players can all compete in the same Workflow.
 
-- [Firmware setup, building, flashing, and badge controls](firmware/README.md)
-- [Web controller, Temporal Cloud, and scoreboard setup](web/README.md)
-- [Game rules and behavior](GAME_SPEC.md)
-- [Engineering journal](blog.md)
+## Temporal Concepts Demonstrated
 
-The firmware and web controller can be developed independently. You only need
-both running for a physical game.
+| Concept | What It Does Here | Where to Look |
+|---|---|---|
+| **Workflow** | One `GameWorkflow` owns the timer, question deck, scores, power-ups, and result | [`web/src/workflow.rs`](web/src/workflow.rs) |
+| **Activities** | Every question is a real `trivia.answer_question` Activity completed by a badge or phone player | [`firmware/src/main.rs`](firmware/src/main.rs), [`web/src/bin/phone_worker.rs`](web/src/bin/phone_worker.rs) |
+| **Heartbeats and Retries** | A simulated crash stops heartbeats so Temporal gives unfinished work to another Worker | [`firmware/src/main.rs`](firmware/src/main.rs), [`web/src/bin/phone_api.rs`](web/src/bin/phone_api.rs) |
+| **Queries** | The scoreboard, badges, and phone API read live state without changing Workflow history | [`web/src/workflow.rs`](web/src/workflow.rs) |
+| **Updates** | Operator power-ups durably change the running Workflow | [`web/src/workflow.rs`](web/src/workflow.rs) |
+| **Visibility and Memo** | Completed rounds remain discoverable without a game-state database | [`web/src/main.rs`](web/src/main.rs) |
 
 ## Architecture
 
-- `firmware/` contains the Rust/ESP-IDF Activity Worker for the
-  [Temporal Replay 2026 Badge](https://badge.temporal.io/), including its OLED
-  UI, button input, deterministic identity, and NVS session state.
-- `web/` contains the Rust Workflow Worker, Axum operator server, 16:9
-  scoreboard, phone UI/API, serverless phone Activity Worker, load simulator,
-  and bundled trivia deck.
-- `shared/` contains the serialized game contract used by both Workers so their
-  Temporal payloads cannot drift independently.
-
-The Mac Workflow Worker and badge Activity Workers use the same logical Task
-Queue, `temporal-trivia-badges-v1`, while polling only their respective task
-types. This makes every process visible together in a Workflow's **Workers**
-tab without allowing the Mac to answer trivia or a badge to execute Workflows.
-
-Temporal Cloud is the durable system of record. The laptop may restart and
-badges may disconnect without resetting the active Workflow. Activities
-abandoned by a failed Worker return to the Task Queue for another badge. Wrong
-answers are successful Activity results and do not retry.
-
-Operator power-ups are durable Workflow Updates. Every awake badge queries the
-Workflow state, displays a short power-up overlay, and then restores its active
-question or waiting screen; answer input is suppressed while the overlay is up.
-
-## Shared requirements
-
-- Git.
-- Rust installed with `rustup`.
-- A Temporal Cloud namespace and API key.
-- macOS or Linux for the host-side tools.
-
-Clone the repository and run all documented commands from its root unless a
-guide says otherwise:
-
-```sh
-git clone https://github.com/Shy/temporal-trivia-badge.git
-cd temporal-trivia-badge
+```mermaid
+flowchart LR
+    TV["Laptop + TV"] -->|Start / Update / Query| Temporal["Temporal Cloud"]
+    Temporal --> GameWorkflow
+    GameWorkflow -->|Activities| BadgeQueue["Badge Task Queue"]
+    GameWorkflow -->|Activities| PhoneQueue["Phone Task Queue"]
+    BadgeQueue --> Badges["Rust badge Workers"]
+    PhoneQueue --> PhoneWorker["Rust phone Worker"]
+    Phones["Phone browsers"] --> PhoneAPI["Rust phone API"]
+    PhoneAPI -->|Heartbeat / complete| Temporal
+    PhoneWorker -->|Signal ready| GameWorkflow
+    GameWorkflow -->|Assignment Query| PhoneAPI
 ```
 
-## Shared Temporal configuration
+The Workflow is the game state. Each player owns at most one outstanding
+Activity, and a heartbeat timeout returns that work to the queue. The laptop
+can restart and reconstruct the board from Temporal history without a separate
+game-state database.
 
-Both components use the same ignored Temporal Cloud configuration:
+## Quick Start
 
-```sh
-cp .env.temporal.example .env
-```
+You need Rust, macOS or Linux, and a Temporal Cloud namespace with an API key.
+Badge hardware is optional for the simulated path.
 
-Fill in `.env`:
+1. Copy the shared configuration and add your Temporal Cloud credentials:
 
-```dotenv
-TEMPORAL_ADDRESS=your-namespace.tmprl.cloud:7233
-TEMPORAL_NAMESPACE=your-namespace.your-account
-TEMPORAL_API_KEY=your-api-key
-```
+   ```sh
+   cp .env.temporal.example .env
+   ```
 
-Process environment variables override these values. Set `TEMPORAL_ENV_FILE`
-to use a file in another location; an explicit path must exist. Temporal Cloud
-uses server-authenticated TLS, and the API key replaces a client certificate,
-not TLS itself.
+2. Start the TV controller:
 
-Configuration files containing Temporal or Wi-Fi credentials are ignored by
-Git. Never commit populated dotenv files, private keys, or generated firmware
-configuration.
+   ```sh
+   ./run-web.sh
+   ```
 
-## Common checks
+3. Start ten simulated badge Workers in a second terminal:
 
-Run formatting and whitespace checks from the repository root:
+   ```sh
+   ./simulate-badges.sh 10
+   ```
 
-```sh
-cargo fmt --all -- --check
-git diff --check
-```
+Open **http://127.0.0.1:3000**, mirror it to the TV, and select **Start Round**.
 
-Component-specific build, test, and hardware verification commands live in the
-[firmware guide](firmware/README.md) and [web guide](web/README.md).
+To use physical hardware, continue with the
+[badge firmware guide](firmware/README.md). To let the audience play from their
+phones, follow [Phone players](web/README.md#phone-players).
 
-## Simulate badges on a Mac
+## Documentation
 
-Start ten software badges against the configured Temporal Cloud namespace:
+| Guide | Covers |
+|---|---|
+| [Badge firmware](firmware/README.md) | ESP Rust toolchain, Wi-Fi, build, flash, controls, sleep, haptics, and physical verification |
+| [Web controller](web/README.md) | TV setup, running a round, operator controls, Worker recovery, tests, and Temporal Visibility |
+| [Phone players](web/README.md#phone-players) | Phone API, anonymous sessions, Activity assignment, and local processes |
+| [Cloud Run](web/README.md#cloud-run-container) | Public phone service, Worker Pool, image deployment, and Secret Manager |
+| [Game specification](GAME_SPEC.md) | Scoring, scheduling, retries, power-ups, UI states, and accepted design decisions |
+| [Engineering journal](blog.md) | Chronological implementation notes, failures, validation, and unresolved work |
 
-```sh
-./simulate-badges.sh 10
-```
+## Project Layout
 
-The launcher creates one process per badge. Each process registers one real
-Rust SDK Activity Worker named `badge/SIM-01` through `badge/SIM-10`, with one
-Activity slot, on the same Task Queue used by the firmware. Stop all simulated
-badges together with `Ctrl-C`. Simulated badges answer correctly 80% of the
-time and incorrectly 20% of the time on a deterministic cadence, so the board
-exercises both score directions. Run `./run-web.sh` in another terminal to use
-the normal controller and web UI.
+- `firmware/` — Rust/ESP-IDF Activity Worker for the Replay 2026 badge.
+- `web/` — Rust Workflow Worker, Axum controller, TV UI, phone path, and
+  simulators.
+- `shared/` — serialized game contract shared by every Worker.
+- `badge-screen/` — hardware-independent 128×64 badge screen renderer and
+  previews.
 
-The most recent physical validation covered build, flash, boot, Wi-Fi,
-Temporal Cloud polling, answers, sleep/wake, supervised Mac Worker recovery,
-and a real heartbeat timeout moving the same Activity from
-`KEEN-SEAL-70` attempt 1 to `KEEN-RAVEN-C8` attempt 2.
-
-## Run phone players locally
-
-Use three terminals after starting the Mac controller:
-
-```sh
-# Terminal 1: TV/controller, with a QR that points at the phone API
-PUBLIC_BASE_URL=http://127.0.0.1:8080 ./run-web.sh
-
-# Terminal 2: phone web UI and API
-./run-phone-api.sh
-
-# Terminal 3: Rust Activity Worker for phone assignments
-./run-phone-worker.sh
-```
-
-Open <http://127.0.0.1:8080> on a phone or another browser. The API gives the
-browser a stable anonymous callsign cookie. It does not send the correct answer
-to the browser. Each session owns at most one real Temporal Activity.
-
-For a 100-phone load test, restart the phone API with its test-only answer key
-enabled, start a round, and run the simulator:
-
-```sh
-PHONE_SIMULATION=1 ./run-phone-api.sh
-./simulate-phones.sh 100
-```
-
-The test-only flag adds the correct answer index to the simulator payload. Do
-not set it on the public Cloud Run service.
+Both the controller and firmware use Temporal Rust SDK `0.7.0`. See the
+component guides for build and test commands.
