@@ -251,6 +251,15 @@ impl GameSnapshot {
         override_value.unwrap_or_else(|| self.players.len().saturating_sub(1).max(1))
     }
 
+    /// Closes the round and names every badge on the top score.
+    ///
+    /// A tie is the normal case, not an edge case: badges answer the same deck
+    /// concurrently and land on the same total often. Everyone level at the top
+    /// wins, and that holds at zero too -- if the timer beats the first answer,
+    /// every badge that joined is tied at nought and every panel reads WINNER.
+    /// A scoreless round is still a round that was played to a draw.
+    ///
+    /// The only round with no winner is one no badge ever joined.
     pub fn finish(&mut self) {
         self.status = GameStatus::Finished;
         let high_score = self.players.values().map(|player| player.score).max();
@@ -267,7 +276,9 @@ impl GameSnapshot {
             })
             .unwrap_or_default();
         if self.winners.is_empty() {
-            self.push_event("Round finished with no answers".to_owned());
+            // Reachable only with an empty roster: any badge that joined has a
+            // score, so it ties for the top even if that top is zero.
+            self.push_event("Round finished with no badges".to_owned());
         } else {
             self.push_event(format!("Winner: {}", self.winners.join(" + ")));
         }
@@ -363,11 +374,11 @@ mod tests {
     }
 
     #[test]
-    fn a_scoreless_round_names_every_badge_that_joined() {
-        // Pins current behaviour rather than endorsing it. `badge_started`
-        // inserts a player at zero before that badge has answered anything, so
-        // a round whose timer beats the first answer leaves the whole field
-        // tied at the maximum and every panel reads WINNER.
+    fn a_scoreless_round_is_a_tie_between_every_badge() {
+        // A scoreless round is a draw, not a void. `badge_started` inserts a
+        // player at zero before that badge has answered anything, so if the
+        // timer beats the first answer the whole field is level at the top and
+        // shares the win.
         let mut state = GameSnapshot::default();
         for badge_id in ["badge-a", "badge-b", "badge-c"] {
             state
@@ -379,15 +390,25 @@ mod tests {
     }
 
     #[test]
-    fn a_round_nobody_joined_has_no_winner() {
+    fn only_a_round_nobody_joined_has_no_winner() {
         let mut state = GameSnapshot::default();
         state.finish();
         assert!(state.winners.is_empty());
         assert_eq!(
             state.events.last().map(|event| event.text.as_str()),
-            Some("Round finished with no answers"),
-            "the empty-field message is the only path that reports no winner"
+            Some("Round finished with no badges"),
+            "an empty roster is the only path that reports no winner"
         );
+    }
+
+    #[test]
+    fn every_badge_level_at_the_top_shares_the_win() {
+        let mut state = GameSnapshot::default();
+        state.players.insert("a".to_owned(), player("a", 7));
+        state.players.insert("b".to_owned(), player("b", 7));
+        state.players.insert("c".to_owned(), player("c", 3));
+        state.finish();
+        assert_eq!(state.winners, ["A", "B"]);
     }
 
     #[test]
