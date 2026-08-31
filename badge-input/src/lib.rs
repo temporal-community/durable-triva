@@ -244,6 +244,24 @@ mod tests {
     }
 
     #[test]
+    fn the_wedge_was_symmetric_so_the_fix_must_be_too() {
+        // An exhaustive search over the four-boolean version showed both LR
+        // and RL wedging, not just RL. Whichever side is still down wins.
+        let (state, choices) = run(&[(LEFT, false), (RIGHT, false), (NONE, false)]);
+        assert_eq!(choices, [Choice::Answer(1)]);
+        assert_eq!(state, ButtonState::Idle);
+    }
+
+    #[test]
+    fn a_crossover_caught_mid_release_still_answers_once() {
+        // The wedge needed the crossover to land inside a single 20 ms sample.
+        // When a tick does catch the gap, the first release answers and the
+        // second press starts a fresh gesture -- two choices, not zero.
+        let (_, choices) = run(&[(RIGHT, false), (NONE, false), (LEFT, false), (NONE, false)]);
+        assert_eq!(choices, [Choice::Answer(1), Choice::Answer(2)]);
+    }
+
+    #[test]
     fn a_powerup_swallows_the_gesture_under_it() {
         let (state, choices) = run(&[(LEFT, false), (LEFT, true), (NONE, false)]);
         assert_eq!(
