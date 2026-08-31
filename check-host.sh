@@ -16,7 +16,7 @@ host_target=$(rustc -vV | awk '/^host: /{print $2}')
 : "${RUSTUP_TOOLCHAIN:=stable}"
 export RUSTUP_TOOLCHAIN
 
-packages="-p temporal-trivia-web -p temporal-trivia-shared -p badge-screen"
+packages="-p temporal-trivia-web -p temporal-trivia-shared -p badge-screen -p badge-input"
 
 echo "==> fmt"
 cargo fmt --all -- --check

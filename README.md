@@ -83,7 +83,7 @@ configuration.
 ## Common checks
 
 Run the host-side checks -- fmt, clippy and the full test suite for `web`,
-`shared` and `badge-screen` -- from the repository root:
+`shared`, `badge-screen` and `badge-input` -- from the repository root:
 
 ```sh
 ./check-host.sh

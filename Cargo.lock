@@ -159,6 +159,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "badge-input"
+version = "0.1.0"
+
+[[package]]
 name = "badge-screen"
 version = "0.1.0"
 dependencies = [
@@ -3136,6 +3140,7 @@ name = "temporal-trivia-badge-firmware"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "badge-input",
  "badge-screen",
  "embuild",
  "esp-idf-svc",

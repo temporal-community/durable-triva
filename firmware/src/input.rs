@@ -1,19 +1,6 @@
 use anyhow::Result;
+pub use badge_input::Buttons;
 use esp_idf_svc::hal::gpio::{Gpio0, Gpio7, Gpio17, Gpio18, Input, PinDriver, Pull};
-
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Buttons {
-    pub up: bool,
-    pub right: bool,
-    pub down: bool,
-    pub left: bool,
-}
-
-impl Buttons {
-    pub fn any(self) -> bool {
-        self.up || self.right || self.down || self.left
-    }
-}
 
 pub struct BadgeInput {
     up: PinDriver<'static, Input>,

@@ -10,6 +10,7 @@ harness = false
 
 [dependencies]
 anyhow = "1"
+badge-input = { path = "../badge-input" }
 badge-screen = { path = "../badge-screen" }
 esp-idf-svc = "=0.52.1"
 futures = "0.3"

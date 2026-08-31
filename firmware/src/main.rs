@@ -44,6 +44,7 @@ use temporalio_sdk::{
 };
 use temporalio_sdk_core::{ActivitySlotKind, FixedSizeSlotSupplier, TunerBuilder, Url};
 
+use badge_input::{ButtonState, Choice, PANIC_HOLD};
 use badge_screen::Status;
 
 use crate::{
@@ -56,7 +57,6 @@ use crate::{
 };
 
 include!(concat!(env!("OUT_DIR"), "/firmware_config.rs"));
-const PANIC_HOLD: Duration = Duration::from_millis(500);
 const HEARTBEAT_BLACKOUT: Duration = Duration::from_secs(6);
 const WORKER_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 const MAX_ACTIVITY_RUNTIME: Duration = Duration::from_secs(120);
@@ -174,11 +174,6 @@ impl Drop for PowerupActiveGuard {
     fn drop(&mut self) {
         self.0.store(false, Ordering::Release);
     }
-}
-
-enum Choice {
-    Answer(u8),
-    Panic,
 }
 
 #[activities]
@@ -343,11 +338,8 @@ impl BadgeActivities {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
 
-        let mut left_armed = false;
-        let mut right_armed = false;
-        let mut combo_started: Option<Instant> = None;
+        let mut state = ButtonState::default();
         let mut last_heartbeat = Instant::now();
-        let mut suppress_until_release = false;
         loop {
             if ctx.is_cancelled()
                 || unix_ms() >= deadline_unix_ms
@@ -361,50 +353,15 @@ impl BadgeActivities {
                 }
                 last_heartbeat = Instant::now();
             }
-            let buttons = self.sample_buttons()?;
-            if self.powerup_active.load(Ordering::Acquire) {
-                suppress_until_release = true;
-                left_armed = false;
-                right_armed = false;
-                combo_started = None;
-                tokio::time::sleep(Duration::from_millis(20)).await;
-                continue;
-            }
-            if suppress_until_release {
-                if !buttons.any() {
-                    suppress_until_release = false;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-                continue;
-            }
-            if buttons.left && buttons.right {
-                let started = combo_started.get_or_insert_with(Instant::now);
-                if started.elapsed() >= PANIC_HOLD {
-                    return Ok(Choice::Panic);
-                }
-                left_armed = true;
-                right_armed = true;
-            } else {
-                if combo_started.take().is_some() {
-                    left_armed = false;
-                    right_armed = false;
-                }
-                if buttons.up {
-                    return Ok(Choice::Answer(0));
-                }
-                if buttons.down {
-                    return Ok(Choice::Answer(3));
-                }
-                if buttons.left {
-                    left_armed = true;
-                } else if left_armed && !right_armed {
-                    return Ok(Choice::Answer(2));
-                }
-                if buttons.right {
-                    right_armed = true;
-                } else if right_armed && !left_armed {
-                    return Ok(Choice::Answer(1));
-                }
+            let (next, choice) = state.advance(
+                self.sample_buttons()?,
+                self.powerup_active.load(Ordering::Acquire),
+                Instant::now(),
+                PANIC_HOLD,
+            );
+            state = next;
+            if let Some(choice) = choice {
+                return Ok(choice);
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
