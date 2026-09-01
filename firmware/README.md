@@ -60,6 +60,20 @@ after changing Temporal credentials or Wi-Fi. Generated configuration stays
 under the ignored root `target/` directory, and build output does not print
 credential values.
 
+**A flashed badge is a credential.** The Wi-Fi password and the Temporal Cloud
+namespace, address and API key are compiled into the application partition as
+plain strings, and anyone holding the badge can recover them:
+
+```sh
+esptool.py --chip esp32s3 read_flash 0x10000 0xE00000 dump.bin
+strings dump.bin | grep tmprl
+```
+
+That key has full access to the namespace — it can start, signal, query and
+terminate every Workflow in it. Treat badges you hand out accordingly: use a
+namespace dedicated to this demo with nothing else in it, and rotate the API
+key once the event is over.
+
 Set `BADGE_WIFI_ENV_FILE` to use a Wi-Fi file in another location. An explicit
 path must exist.
 
@@ -115,6 +129,10 @@ running. Set `ESPFLASH` to an executable path to override the flashing tool.
   unfinished question available to another Worker.
 - A wrong answer applies the score penalty and completes the Activity normally.
   Only a simulated Worker failure returns the question to the Task Queue.
+- A badge that has abandoned a question refuses it on sight if Temporal offers
+  it back, without drawing anything, so the retry reaches another Worker.
+- Dropped heartbeats are tolerated for ten seconds before the badge releases
+  its question. Temporal's fifteen-second timeout remains what reassigns it.
 - A web power-up causes each awake badge to vibrate and show a 1.5-second
   overlay from the durable Workflow state. The badge restores its question or
   waiting screen afterward and ignores answer input while the overlay is up.
@@ -144,12 +162,26 @@ logs can verify the event path but cannot verify how the motor feels.
 
 ### Automated two-badge acceptance
 
-The flashed firmware accepts a small HIL command protocol over its USB serial
-connection. With the controller running and exactly two badges connected, run:
+The HIL command protocol is **not** in the default image. `HIL ANSWER CORRECT`
+reads the correct index out of the question the badge is holding, so a badge
+carrying that reader is a badge anyone with a USB cable can win a round on.
+`build-firmware.sh` asserts the gate either way and prints which image it built.
+
+Build and flash the acceptance image explicitly:
+
+```sh
+./build-firmware.sh --features hil
+./flash-badge.sh /dev/cu.usbmodem101
+```
+
+Then, with the controller running and exactly two badges connected, run:
 
 ```sh
 uv run --script tools/test_physical_badges.py
 ```
+
+Reflash the badges with a plain `./build-firmware.sh` image before handing them
+to anyone.
 
 The runner identifies both physical callsigns, starts a Workflow using the
 normal scheduler policy, and requires both real badge Workers to own questions
@@ -158,9 +190,13 @@ Workers have logged that they are polling Temporal. The runner then asks each
 badge firmware to inject the question's correct directional gesture and
 verifies that Temporal records one correct answer per badge. It also verifies
 that both badges leave the final result screen and return to waiting for the
-next round. Opening the serial ports may reset the badges, so the identification
-step allows time for a complete boot and reconnect. `--backlog-override N`
-remains available for a deliberately nonstandard diagnostic run.
+next round. `--backlog-override N` remains available for a deliberately
+nonstandard diagnostic run.
+
+Readiness and simultaneous ownership are both asked for over `HIL STATUS`,
+which reports `polling=` and `active=` on demand. The runner opens each port
+without toggling reset, so it cannot depend on a boot log line that a
+still-running badge printed minutes ago.
 
 This exercises the physical ESP32-S3 boards, firmware, Wi-Fi, Temporal Workers,
 and the same input state machine used by the face buttons. It does not optically

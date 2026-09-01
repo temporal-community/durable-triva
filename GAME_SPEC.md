@@ -1,12 +1,9 @@
 # Game contract
 
 - The operator starts one 60-second game from the Mac web UI mirrored to a TV.
-- Physical badges and phone players compete in the same Workflow, score table,
-  and question pool. Any participant may join late at score zero; there is no
-  frozen roster. Badge-only and phone-only rounds are both valid.
-- The TV attract loop carries a QR code for the stable Cloud Run phone URL. A
-  phone receives a deterministic badge-style callsign in a long-lived cookie;
-  there is no login or shared identity database.
+- Physical and simulated badges compete in the same Workflow, score table, and
+  question pool. Any badge may join late at score zero; there is no frozen
+  roster.
 - Correct answers score `+1`. Wrong answers score `-1` and complete the
   Activity normally; the question is consumed. During double-points chaos
   those values become `+2` and `-2`. Activity retries are reserved for genuine
@@ -17,20 +14,20 @@
   refuses that question for the rest of the game, allowing another Worker to
   recover it. Panic itself scores `0`.
 - The controller counts active ESP32 Activity pollers when a round starts. The
-  Workflow keeps one outstanding Activity per registered participant, with a
-  minimum of one bootstrap Activity for a phone-only round. Phone joins grow
-  that target during the round. Retrying unfinished work is not a duplicate;
-  it may wait briefly for a Worker rather than leaving a healthy participant
-  idle throughout normal play. The API may override the target for diagnostics.
-- Phones do not impersonate SDK Workers. A Rust Temporal Worker on a GCP Cloud
-  Run Worker Pool receives real Activities, assigns them durably through the
-  Game Workflow, and returns `WillCompleteAsync`. The stateless phone API
-  heartbeats and completes those Activities by Workflow, run, and Activity ID.
-  Every phone session owns at most one outstanding Activity.
-- Holding the phone's SIMULATE CRASH control for 500 ms stops heartbeats for
-  six seconds. Temporal's five-second heartbeat timeout retries the unfinished
-  Activity. The crashing phone cannot reclaim that question during the round,
-  and its recovery screen lasts for the same interval as the badge behavior.
+  Workflow keeps one outstanding Activity per badge detected at round start, so
+  every connected badge keeps playing. Retrying unfinished work is not a
+  duplicate; it may wait briefly for a Worker rather than leaving a healthy
+  badge idle throughout normal play. The API may override the target for
+  diagnostics.
+- A badge tolerates unacknowledged Activity heartbeats for ten seconds before
+  it gives its question up. Temporal's fifteen-second server timeout stays the
+  authority on reassignment; the badge simply stops holding a question it can
+  no longer answer. A single dropped RPC costs nothing, because handing a
+  healthy player's question to another badge over one lost packet is both a
+  worse game and a false handoff on the board.
+- A badge refuses a question it has already abandoned before drawing it or
+  sending anything, so a badge leaving its crash blackout cannot flash a
+  question it will never answer while another Worker waits for the retry.
 - The global deadline cancels outstanding Activities for zero points. There is
   no per-badge timer. Ties create shared winners.
 - Callsigns derive deterministically from the factory MAC and survive reboots.
@@ -41,7 +38,11 @@
   revision wake lines retained as fallbacks. Sleep is not armed while an
   Activity owns the answer controls.
 - The OLED uses wrapped questions, a compact 2x2 answer grid, and positional
-  Nintendo-style glyphs rather than bare button letters.
+  Nintendo-style glyphs rather than bare button letters. Three tasks can draw
+  to it -- the Activity, the sleep monitor and the result watcher -- and only
+  the Activity may overwrite a live question. The other two test that ownership
+  while holding the display lock, so a question drawn in the gap between a
+  check and a draw is never erased by a screen that no longer applies.
 - A badge draws an assigned question before sending best-effort assignment
   telemetry. Game Signals have a 750 ms UI-path ceiling, so a slow Cloud round
   trip cannot leave the screen looking frozen. Between Activities the OLED
@@ -69,11 +70,8 @@
   Rust Workers, Temporal Activity retry, and the 60-second rules. Starting the
   next Workflow remains a separate deliberate operator action. The finished
   board remains visible for 30 seconds, then enters this attract loop
-  automatically; selecting New Round enters it immediately.
-- The attract loop defaults to the original astronaut tardigrade and explains
-  the physical badge Worker path. Phone joining is opt-in: an operator button
-  swaps the artwork for the large QR code and can switch straight back. The TV
-  does not carry an always-visible QR during badge-first booth operation.
+  automatically; selecting New Round enters it immediately. The attract loop
+  carries the astronaut tardigrade and explains the physical badge Worker path.
 - Operator controls execute validated Workflow Updates for ten seconds of
   double points, ten seconds of Rust-only scheduling, sudden death on the next
   correct answer, and one `+30 seconds` timer extension. The three gameplay
@@ -97,24 +95,19 @@
   are optional when the Cloud API key has namespace-operator permission.
 - The deck is 30% Rust, 15% Temporal, 15% mental math, and 40% family-friendly
   general trivia. Temporal questions are mostly introductory. The Workflow
-  exhausts a shuffled deck before refilling it, so a retry preserves its
-  question and ordinary duplicates do not enter the pool early.
-- The phone path is a stateless Rust Cloud Run service plus a Rust Temporal
-  Serverless Worker Pool. The Mac continues to run the TV, operator API, and
-  Workflow Worker. The Worker Pool may scale to zero; the operator runs a demo
-  before stage use to warm it. `PUBLIC_BASE_URL` supplies the QR target.
-- The phone API batches assignment discovery into one disposable roster cache
-  refresh every 250 ms. Browser state polls never fan out into individual
-  Temporal queries. Heartbeats and answers address asynchronous Activities
-  directly by Workflow ID, Run ID, and Activity ID. An API restart rebuilds
-  the cache from a Workflow query; durable state never lives only in memory.
+  exhausts a shuffled deck before recycling it, so a retry preserves its
+  question and ordinary duplicates do not enter the pool early. Recycling also
+  happens when nothing left in the deck is eligible: Rust-only scheduling deals
+  no other category, so a deck that has run out of Rust cards can never empty
+  on its own and would otherwise leave every badge idle until the modifier
+  expires. A recycled cycle keeps the undealt remainder and suffixes its
+  question IDs, so no two Activities ever share one ID.
 - Worker Versioning is a deliberate follow-up, not part of the basic release.
   The eventual demo will be triggered from a mirrored terminal command and
   will preserve gameplay mechanics across versions.
-- Acceptance target: 100 simultaneous phones, ten simulated badge Workers,
-  and two physical badges across three consecutive rounds. Assignment latency
-  after warm-up must remain below two seconds, and taking the entire phone/GCP
-  path offline must not stop badge-only play.
+- Acceptance target: ten simulated badge Workers and two physical badges across
+  three consecutive rounds, with assignment latency after warm-up below two
+  seconds.
 - Demo-ready acceptance requires two physical badges proving that a fake crash
   produces a heartbeat timeout and moves the same question to the other badge
   as a higher real Temporal Activity attempt.

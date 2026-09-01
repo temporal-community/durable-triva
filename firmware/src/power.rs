@@ -13,6 +13,7 @@ use crate::{
     display::BadgeDisplay,
     haptics::{self, HapticEvent, SharedHaptics},
     input::BadgeInput,
+    with_display_if_idle,
 };
 
 const SLEEP_ARM_DELAY: Duration = Duration::from_millis(250);
@@ -64,10 +65,12 @@ pub async fn monitor(
             .sample();
         if !buttons.down {
             if down_since.take().is_some() && shown_second.take().is_some() {
-                display
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("display lock poisoned"))?
-                    .show_waiting(&callsign)?;
+                // A question can be assigned between the check at the top of
+                // this loop and here, so ownership is re-tested under the
+                // display lock rather than trusted from a few lines ago.
+                with_display_if_idle(&display, &activity_active, |screen| {
+                    screen.show_waiting(&callsign)
+                })?;
             }
             tokio::time::sleep(POLL_INTERVAL).await;
             continue;
@@ -78,17 +81,20 @@ pub async fn monitor(
             log::info!("DOWN held for 3 seconds; entering deep sleep");
             if shown_second != Some(0) {
                 shown_second = Some(0);
-                display
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("display lock poisoned"))?
-                    .show_sleep_countdown(&callsign, 0)?;
+                with_display_if_idle(&display, &activity_active, |screen| {
+                    screen.show_sleep_countdown(&callsign, 0)
+                })?;
                 haptics::play(&haptics, HapticEvent::SleepCountdown).await;
             }
-            {
-                let mut screen = display
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("display lock poisoned"))?;
-                screen.show_sleeping(&callsign)?;
+            if !with_display_if_idle(&display, &activity_active, |screen| {
+                screen.show_sleeping(&callsign)
+            })? {
+                // A question arrived while the countdown was finishing. The
+                // player is in a round now; sleeping would drop them out of it.
+                down_since = None;
+                shown_second = None;
+                tokio::time::sleep(POLL_INTERVAL).await;
+                continue;
             }
             while input
                 .lock()
@@ -98,10 +104,7 @@ pub async fn monitor(
             {
                 tokio::time::sleep(POLL_INTERVAL).await;
             }
-            display
-                .lock()
-                .map_err(|_| anyhow::anyhow!("display lock poisoned"))?
-                .power_off()?;
+            with_display_if_idle(&display, &activity_active, |screen| screen.power_off())?;
             haptics::off(&haptics).await?;
             enter_deep_sleep()?;
         }
@@ -111,10 +114,9 @@ pub async fn monitor(
             let remaining_seconds = remaining_ms.div_ceil(1000);
             if shown_second != Some(remaining_seconds) {
                 shown_second = Some(remaining_seconds);
-                display
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("display lock poisoned"))?
-                    .show_sleep_countdown(&callsign, remaining_seconds)?;
+                with_display_if_idle(&display, &activity_active, |screen| {
+                    screen.show_sleep_countdown(&callsign, remaining_seconds)
+                })?;
                 haptics::play(&haptics, HapticEvent::SleepCountdown).await;
             }
         }

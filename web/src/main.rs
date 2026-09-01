@@ -24,7 +24,6 @@ use axum::{
     routing::{get, post},
 };
 use futures::{Stream, StreamExt};
-use qrcode::{QrCode, render::svg};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use temporalio_client::{
@@ -127,17 +126,24 @@ struct RecoveryProof {
     snapshot: GameSnapshot,
 }
 
+/// The badges the scheduler can currently see.
+///
+/// This is deliberately the same view `start_game` sizes the round from, not
+/// the previous round's roster: "start once the badges are polling" is only
+/// actionable if the operator is shown the number the Workflow will use. A
+/// badge that has begun polling locally still takes a moment to appear here.
+#[derive(Debug, Serialize)]
+struct ActiveBadges {
+    count: usize,
+    callsigns: Vec<String>,
+}
+
 #[derive(Debug, Serialize)]
 struct WorkflowDetails {
     workflow_id: String,
     run_id: String,
     namespace: String,
     temporal_ui_url: String,
-}
-
-#[derive(Debug, Serialize)]
-struct PhoneConfig {
-    url: String,
 }
 
 #[derive(Debug)]
@@ -194,9 +200,8 @@ async fn main() -> Result<()> {
             )
             .route("/assets/space-grotesk.ttf", get(space_grotesk_asset))
             .route("/assets/space-mono.ttf", get(space_mono_asset))
-            .route("/assets/phone-qr.svg", get(phone_qr_asset))
             .route("/api/state", get(current_state))
-            .route("/api/phone-config", get(phone_config))
+            .route("/api/badges", get(active_badges))
             .route("/api/recovery", get(recovery_proof))
             .route("/api/workflow", get(workflow_details))
             .route("/api/events", get(event_stream))
@@ -257,33 +262,19 @@ async fn space_mono_asset() -> Response {
     asset("font/ttf", SPACE_MONO_TTF)
 }
 
-async fn phone_qr_asset() -> Result<Response, ApiError> {
-    let url = phone_public_url();
-    let code = QrCode::new(url.as_bytes())
-        .map_err(|error| ApiError(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
-    let body = code.render::<svg::Color>().quiet_zone(true).build();
-    Ok((
-        [
-            (header::CONTENT_TYPE, "image/svg+xml"),
-            (header::CACHE_CONTROL, ASSET_CACHE_CONTROL),
-        ],
-        body,
+/// Live game state and round history are never cacheable: the recovery path
+/// re-reads `/api/state` on every EventSource reopen, which is exactly when a
+/// stale board would be most misleading.
+fn uncacheable(value: impl Serialize) -> Response {
+    (
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(serde_json::to_value(value).unwrap_or(serde_json::Value::Null)),
     )
-        .into_response())
+        .into_response()
 }
 
-async fn phone_config() -> Json<PhoneConfig> {
-    Json(PhoneConfig {
-        url: phone_public_url(),
-    })
-}
-
-fn phone_public_url() -> String {
-    std::env::var("PUBLIC_BASE_URL").unwrap_or_else(|_| "http://127.0.0.1:8080".to_owned())
-}
-
-async fn current_state(State(state): State<AppState>) -> Json<GameSnapshot> {
-    Json(state.snapshot.read().await.clone())
+async fn current_state(State(state): State<AppState>) -> Response {
+    uncacheable(state.snapshot.read().await.clone())
 }
 
 async fn recovery_proof(State(state): State<AppState>) -> Json<RecoveryProof> {
@@ -355,9 +346,10 @@ async fn start_game(
             format!("backlog override must be between 1 and {MAX_BACKLOG_OVERRIDE}"),
         ));
     }
-    let detected_badge_count = active_badge_count(&state.client)
+    let detected_badge_count = active_badge_workers(&state.client)
         .await
-        .map_err(|error| ApiError(StatusCode::BAD_GATEWAY, error.to_string()))?;
+        .map_err(|error| ApiError(StatusCode::BAD_GATEWAY, error.to_string()))?
+        .len();
     let deck = questions::build_deck(rand::random(), DECK_SIZE)
         .map_err(|error| ApiError(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let game_id = format!("trivia-{}", Uuid::new_v4().simple());
@@ -415,7 +407,18 @@ async fn start_game(
     Ok(Json(starting))
 }
 
-async fn active_badge_count(client: &Client) -> Result<usize> {
+async fn active_badges(State(state): State<AppState>) -> Result<Response, ApiError> {
+    let callsigns = active_badge_workers(&state.client)
+        .await
+        .map_err(|error| ApiError(StatusCode::BAD_GATEWAY, error.to_string()))?;
+    Ok(uncacheable(ActiveBadges {
+        count: callsigns.len(),
+        callsigns,
+    }))
+}
+
+/// Callsigns of the badge Activity Workers Temporal currently lists as polling.
+async fn active_badge_workers(client: &Client) -> Result<Vec<String>> {
     let request = DescribeTaskQueueRequest {
         namespace: client.namespace(),
         task_queue: Some(TaskQueue {
@@ -438,7 +441,7 @@ async fn active_badge_count(client: &Client) -> Result<usize> {
         .unwrap_or_default()
         .as_secs() as i64;
     let oldest_active_seconds = now_seconds - ACTIVE_BADGE_POLLER_MAX_AGE.as_secs() as i64;
-    Ok(pollers
+    let mut callsigns = pollers
         .into_iter()
         .filter(|poller| is_badge_worker_identity(&poller.identity))
         .filter(|poller| {
@@ -447,9 +450,18 @@ async fn active_badge_count(client: &Client) -> Result<usize> {
                 .as_ref()
                 .is_some_and(|last_access| last_access.seconds >= oldest_active_seconds)
         })
-        .map(|poller| poller.identity)
+        .map(|poller| {
+            poller
+                .identity
+                .strip_prefix("badge/")
+                .unwrap_or(&poller.identity)
+                .to_owned()
+        })
         .collect::<HashSet<_>>()
-        .len())
+        .into_iter()
+        .collect::<Vec<_>>();
+    callsigns.sort_unstable();
+    Ok(callsigns)
 }
 
 /// Update rejections come back as `Update failed:` and mean the Workflow's
@@ -544,7 +556,7 @@ async fn crash_worker() -> Result<Json<serde_json::Value>, ApiError> {
     })))
 }
 
-async fn round_history(State(state): State<AppState>) -> Result<Json<Vec<RoundSummary>>, ApiError> {
+async fn round_history(State(state): State<AppState>) -> Result<Response, ApiError> {
     let stream = state.client.list_workflows(
         format!("WorkflowId = '{ACTIVE_WORKFLOW_ID}' AND ExecutionStatus = 'Completed'"),
         WorkflowListOptions::builder()
@@ -562,7 +574,7 @@ async fn round_history(State(state): State<AppState>) -> Result<Json<Vec<RoundSu
     }
     rounds.sort_by_key(|round| std::cmp::Reverse(round.closed_unix_ms.unwrap_or_default()));
     rounds.truncate(ROUND_HISTORY_LIMIT);
-    Ok(Json(rounds))
+    Ok(uncacheable(rounds))
 }
 
 fn round_summary(execution: &WorkflowExecution) -> Option<RoundSummary> {
@@ -570,7 +582,7 @@ fn round_summary(execution: &WorkflowExecution) -> Option<RoundSummary> {
     Some(RoundSummary {
         game_id: memo.game_id,
         run_id: execution.run_id().to_owned(),
-        closed_unix_ms: execution.close_time().map(system_time_unix_ms),
+        closed_unix_ms: execution.close_time().map(crate::workflow::unix_ms),
         winners: memo.winners,
         badge_count: memo.badge_count,
         correct_answers: memo.correct_answers,
@@ -580,12 +592,6 @@ fn round_summary(execution: &WorkflowExecution) -> Option<RoundSummary> {
         heartbeat_timeouts: memo.heartbeat_timeouts,
         activity_attempts: memo.activity_attempts,
     })
-}
-
-fn system_time_unix_ms(time: SystemTime) -> u64 {
-    time.duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
 }
 
 /// The Workflow Query the recovery proof rests on.

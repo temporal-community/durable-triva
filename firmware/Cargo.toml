@@ -8,6 +8,13 @@ publish = false
 name = "temporal-trivia-badge-firmware"
 harness = false
 
+[features]
+# The USB hardware-in-the-loop command reader is an acceptance-test tool, not a
+# shipped capability: it injects a correct answer into a live round. Build the
+# image people carry without it; build the one tools/test_physical_badges.py
+# drives with `./build-firmware.sh --features hil`.
+hil = []
+
 [dependencies]
 anyhow = "1"
 badge-input = { path = "../badge-input" }

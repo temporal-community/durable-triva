@@ -1,5 +1,118 @@
 # Engineering journal
 
+## 2026-09-01 — Phone path removed and the review findings fixed
+
+- A full-project review at `b0979d6` found a P0 in the public phone service:
+  `phone_answer` completed any Activity named in the request body, stamped with
+  the caller's own session. Activity IDs are question IDs and most of them are
+  literals in a public repo, so any phone could score for — or destroy —
+  another player's question, a physical badge's included. Three more findings
+  lived in the same surface: the 6 s crash blackout could never fire under the
+  15 s heartbeat timeout the badges had been moved to, a join Signal dropped in
+  the 250 ms roster-cache window locked that phone out of every later round for
+  the life of the API process, and the only way to run the documented 100-phone
+  load test was to set `PHONE_SIMULATION=1`, which serves the correct answer to
+  every phone.
+- Removed the phone path rather than repairing it: both binaries, the phone UI,
+  the Cloud Run container, the QR attract panel, and the phone half of the game
+  contract. Badges are the whole game again. Badge-only histories replay
+  unchanged, because phone Activities were only ever scheduled when a phone had
+  registered or no badge had; phone-round histories are deliberately abandoned.
+  `qrcode` and `reqwest` went with it.
+- `temporalio-workflow` looked like an unused dependency to both grep and the
+  review. It is not: `#[workflow]` and `#[workflow_methods]` expand to paths
+  rooted at `::temporalio_workflow`. Removing it broke both crates on the next
+  build. Restored with a comment in each manifest.
+- **Rust-only chaos could freeze the whole board.** The deck recycled only when
+  empty, but Rust-only deals no other category, so once the 30 Rust cards in a
+  150-card deck were gone the deck filled with everything else and could never
+  empty — no badge got another question until the modifier expired ten seconds
+  later. Recycling is now driven by eligibility and keeps the undealt
+  remainder, behind patch ID `eligible-deck-refill-v1`. The test that appeared
+  to cover this was named `..._falls_back_when_the_rust_pool_is_empty` and
+  asserted the opposite; it is now four tests that each prove their name.
+- **One dropped heartbeat RPC used to end the Activity outright**, taking a
+  question off a player mid-read and printing `WORK REASSIGNED · heartbeat
+  timeout` on the TV for what was a single lost packet. The RPC and the verdict
+  are now separate: `heartbeat_once` reports acknowledged, missed or stopped,
+  and only `BADGE_HEARTBEAT_FAILURE_BUDGET_MS` (10 s, asserted below Temporal's
+  15 s) ends the attempt. `AsyncActivityError::NotFound` is treated as
+  definitive rather than spending the budget on a question that no longer
+  exists — that path is visible in every acceptance log as `Activity attempt 1
+  is no longer known to Temporal: workflow execution already completed`.
+- A badge now refuses a question it has abandoned before drawing it or sending
+  anything. It used to draw the question, write NVS and spend three Cloud round
+  trips before saying no, and a badge leaving its crash blackout is the freest
+  poller on the queue and so the likeliest to be handed its own abandoned
+  question back.
+- Gave the OLED a single owner. The Activity, the sleep monitor and the result
+  watcher all draw to it, and the other two checked `activity_active` before
+  taking the display lock — leaving a window where a question drawn in between
+  was erased with nothing to redraw it. `with_display_if_idle` re-tests
+  ownership under the lock. Holding DOWN as a round starts is the reachable
+  version of that.
+- Bounded the OLED I2C writes at 50 ms. They used `BLOCK`, and on one
+  current-thread runtime a stuck bus would have taken the heartbeat loop, the
+  Worker poller and the sleep monitor down with the screen.
+- Gated the USB HIL reader behind a non-default `hil` feature. `HIL ANSWER
+  CORRECT` reads the correct index out of the question the badge is holding, so
+  the image people carry must not contain it. `build-firmware.sh` now asserts
+  which image it built, alongside the existing version assertion.
+- `flash-badge.sh` writes `--no-skip`. The incremental write that once left a
+  trailing segment erased and produced `invalid segment length 0xffffffff` was
+  a documented incident that the script had never been updated for. Added
+  `FLASH_MONITOR=0` so several badges can be flashed from a script.
+- Documented that a flashed badge is a credential: the Wi-Fi password and the
+  Temporal namespace, address and API key are recoverable with `esptool.py
+  read_flash` plus `strings`. Use a dedicated namespace and rotate after the
+  event.
+- Added the `AGENTS.md` that the review expected and did not find, fixed the
+  `#shared-temporal-configuration` anchor both component guides linked to and
+  the root README never had, deleted dead `GameWorkflow::questions` state, put
+  `no-store` on `/api/state` and `/api/history`, and gave `config_path` a
+  candidate list instead of the same path twice.
+
+### Hardware acceptance — ten runs on KEEN-RAVEN-C8 and KEEN-SEAL-70
+
+- The HIL runner used to wait for `Polling trivia queue`, a line printed once at
+  boot, while deliberately opening the port without toggling reset — so a
+  second run against still-running badges could only hang. `HIL STATUS` now
+  reports `polling=` and `active=`, and the runner waits on those. It also waits
+  for the controller's new `/api/badges` to list both callsigns, because the
+  firmware flag only means the Worker task started; the round is sized from
+  Temporal's poller list, which lags it by seconds. Starting on the firmware
+  flag alone produced `detected_badge_count: 0` and a round that scheduled
+  nothing. `/api/badges` also feeds the TV attract roster, which until now
+  showed the *previous* round's players while telling the operator to start
+  once badges were polling.
+- The simultaneity check was a buffer scan for `preparation complete` on each
+  badge, which two sequential ownerships also satisfy. It now asks both boards
+  what they are holding right now.
+- **Two regressions were caught on hardware and fixed, not shipped.** Putting
+  `#[cfg(feature = "hil")]` inside `BadgeInput::sample` panicked both badges
+  with a double exception on the second question of run 4; `sample` is back to
+  one shape for both builds and only `inject_answer` is gated. And the new
+  ownership check let the result watcher skip its restore when the finished
+  round's Activity still owned the screen, with no retry — run 7 left Raven on
+  its question. The watcher now offers the screen back for up to ten seconds
+  and logs which of the three outcomes happened, along with arming, finishing
+  and giving up, none of which it used to say anything about.
+- Runs 8, 9 and 10 were three consecutive passes with no reflash and no power
+  cycle: both badges polling, both holding attempt-1 questions simultaneously,
+  one correct answer each, immediate follow-ups, both returning to waiting,
+  zero panics, zero reboots, zero reassignments and zero heartbeat timeouts.
+  Runs 9 and 10 each had one first question arrive on attempt 2 — the
+  first-poll delivery race this journal has recorded before, unchanged by this
+  work and not a reassignment between badges.
+- Strict Clippy, `cargo fmt`, all 76 host tests, `git diff --check`, Ruff lint
+  and format, and both ESP32-S3 release builds pass. Both badges were left on
+  the default no-HIL image, verified by the build assertion.
+- Not verified: OLED pixels were never optically inspected, and haptics,
+  sleep/wake and the physical LEFT+RIGHT crash gesture were not exercised —
+  every answer in these ten runs was injected over USB. The crash-handoff path
+  the abandoned-question fix is aimed at therefore remains unproven on
+  hardware, as it was before this work.
+
 ## 2026-08-30 — Phone-player architecture locked
 
 - Chose one mixed game rather than a separate crowd mode: physical badges and

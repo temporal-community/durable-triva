@@ -7,9 +7,7 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use badge_screen::{Canvas, HEIGHT, Status, WIDTH};
-use temporal_trivia_shared::{
-    ChaosCommand, GameSnapshot, GameStatus, PlayerKind, PlayerScore, Question,
-};
+use temporal_trivia_shared::{ChaosCommand, GameSnapshot, GameStatus, PlayerScore, Question};
 
 const SCALE: usize = 3;
 const CALLSIGN: &str = "KEEN-RAVEN-C8";
@@ -43,7 +41,6 @@ fn snapshot(winners: &[&str]) -> GameSnapshot {
             PlayerScore {
                 badge_id: format!("badge-{index}"),
                 callsign: (*callsign).to_owned(),
-                kind: PlayerKind::Badge,
                 score: 36 - (index as i32) * 4,
                 correct: 48 - (index as u32) * 5,
                 wrong: 12,

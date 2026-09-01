@@ -10,7 +10,6 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Deserializer, Serialize, de};
 
 pub const BADGE_TASK_QUEUE: &str = "temporal-trivia-badges-v1";
-pub const PHONE_TASK_QUEUE: &str = "temporal-trivia-phones-v1";
 // Workflow and Activity Workers share one logical Task Queue so Temporal UI's
 // Workflow Workers tab can show the Mac controller and physical badges
 // together. WorkerTaskTypes still prevents either process from accepting the
@@ -26,10 +25,34 @@ pub const BADGE_HEARTBEAT_INTERVAL_MS: u64 = 1_000;
 pub const BADGE_HEARTBEAT_TIMEOUT_MS: u64 = 15_000;
 /// A deliberate badge failure must remain silent past the Temporal timeout.
 pub const BADGE_CRASH_BLACKOUT_MS: u64 = 16_000;
+/// How long a badge tolerates unacknowledged Activity heartbeats before it
+/// gives its question up.
+///
+/// Temporal's server-side timeout is the real authority. This sits below it so
+/// a badge that genuinely cannot reach Cloud stops holding a question it can
+/// no longer answer, while a single dropped RPC costs nothing. Failing on the
+/// first error handed a healthy player's question to another badge over one
+/// lost packet, and labelled it a heartbeat timeout on the TV.
+pub const BADGE_HEARTBEAT_FAILURE_BUDGET_MS: u64 = 10_000;
 const _: () = {
     assert!(BADGE_HEARTBEAT_INTERVAL_MS < BADGE_HEARTBEAT_TIMEOUT_MS);
     assert!(BADGE_HEARTBEAT_TIMEOUT_MS < BADGE_CRASH_BLACKOUT_MS);
+    assert!(BADGE_HEARTBEAT_INTERVAL_MS < BADGE_HEARTBEAT_FAILURE_BUDGET_MS);
+    // Give up before Temporal does, never after: the server reassigning a
+    // question the badge still believes it owns is the one ordering that
+    // shows two badges the same live question.
+    assert!(BADGE_HEARTBEAT_FAILURE_BUDGET_MS < BADGE_HEARTBEAT_TIMEOUT_MS);
 };
+
+/// Whether a badge should give its question up after this long without an
+/// acknowledged Activity heartbeat.
+///
+/// Split out from the RPC call so the decision is testable from a development
+/// host; the firmware crate only builds for the badge.
+#[must_use]
+pub const fn heartbeat_budget_exhausted(since_acknowledged_ms: u64) -> bool {
+    since_acknowledged_ms >= BADGE_HEARTBEAT_FAILURE_BUDGET_MS
+}
 /// Rolling event window carried on every snapshot.
 pub const EVENT_WINDOW: usize = 24;
 
@@ -146,66 +169,10 @@ pub struct GameInput {
 pub struct PlayerScore {
     pub badge_id: String,
     pub callsign: String,
-    #[serde(default)]
-    pub kind: PlayerKind,
     pub score: i32,
     pub correct: u32,
     pub wrong: u32,
     pub panics: u32,
-}
-
-#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum PlayerKind {
-    #[default]
-    Badge,
-    Phone,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct PhoneJoin {
-    pub session_id: String,
-    pub callsign: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct PhoneActivityReady {
-    pub activity_id: String,
-    pub workflow_run_id: String,
-    pub attempt: u32,
-    pub task: QuestionTask,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct PhoneAssignment {
-    pub activity_id: String,
-    pub workflow_run_id: String,
-    pub attempt: u32,
-    pub task: QuestionTask,
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct PhoneSessionSnapshot {
-    pub session_id: String,
-    pub callsign: String,
-    pub game_id: Option<String>,
-    pub status: GameStatus,
-    pub deadline_unix_ms: Option<u64>,
-    pub assignment: Option<PhoneAssignment>,
-    pub player: Option<PlayerScore>,
-    pub rank: Option<u32>,
-    pub winners: Vec<String>,
-    pub latest_powerup: Option<PowerupNotice>,
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct PhoneRosterSnapshot {
-    pub game_id: Option<String>,
-    pub status: GameStatus,
-    pub deadline_unix_ms: Option<u64>,
-    pub winners: Vec<String>,
-    pub latest_powerup: Option<PowerupNotice>,
-    pub sessions: BTreeMap<String, PhoneSessionSnapshot>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -268,8 +235,6 @@ pub struct GameSnapshot {
     pub scheduled_questions: u32,
     pub players: BTreeMap<String, PlayerScore>,
     #[serde(default)]
-    pub registered_phone_count: u32,
-    #[serde(default)]
     pub detected_badge_count: u32,
     pub latest_answer: Option<AnswerSpotlight>,
     pub events: Vec<GameEvent>,
@@ -313,17 +278,11 @@ impl GameSnapshot {
 
     /// How many Activities the Workflow keeps outstanding.
     ///
-    /// GAME_SPEC: keep one Activity outstanding per registered participant.
-    /// Phone players join after the Workflow starts, so the durable counts are
-    /// the fallback source of truth when the controller supplies no override.
-    /// Heartbeat retries may wait briefly for a Worker instead of leaving an
-    /// otherwise healthy player idle throughout normal play.
+    /// GAME_SPEC: keep one Activity outstanding per badge detected at round
+    /// start. Heartbeat retries may wait briefly for a Worker instead of
+    /// leaving an otherwise healthy badge idle throughout normal play.
     pub fn target_backlog(&self, override_value: Option<usize>) -> usize {
-        override_value.unwrap_or_else(|| {
-            let participants =
-                self.detected_badge_count as usize + self.registered_phone_count as usize;
-            participants.max(1)
-        })
+        override_value.unwrap_or_else(|| (self.detected_badge_count as usize).max(1))
     }
 
     /// Closes the round and names every badge on the top score.
@@ -379,13 +338,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn backlog_keeps_every_participant_playing() {
+    fn backlog_keeps_every_badge_playing() {
         let mut state = GameSnapshot::default();
-        assert_eq!(state.target_backlog(None), 1);
+        assert_eq!(
+            state.target_backlog(None),
+            1,
+            "a bootstrap slot with no roster"
+        );
         state.detected_badge_count = 10;
         assert_eq!(state.target_backlog(None), 10);
-        state.registered_phone_count = 100;
-        assert_eq!(state.target_backlog(None), 110);
         assert_eq!(
             state.target_backlog(Some(33)),
             33,
@@ -409,6 +370,25 @@ mod tests {
         }
         state.finish();
         assert_eq!(state.winners, ["CRAB-02", "FERRIS-01"]);
+    }
+
+    #[test]
+    fn a_dropped_heartbeat_costs_nothing_until_the_budget_runs_out() {
+        // The defect this pins: one failed heartbeat RPC used to end the
+        // Activity outright, so a single lost packet took a question away
+        // from a player mid-read and showed a fabricated handoff on the TV.
+        assert!(!heartbeat_budget_exhausted(0), "the first miss is free");
+        assert!(!heartbeat_budget_exhausted(BADGE_HEARTBEAT_INTERVAL_MS));
+        assert!(!heartbeat_budget_exhausted(
+            BADGE_HEARTBEAT_FAILURE_BUDGET_MS - 1
+        ));
+        assert!(heartbeat_budget_exhausted(
+            BADGE_HEARTBEAT_FAILURE_BUDGET_MS
+        ));
+        assert!(
+            heartbeat_budget_exhausted(BADGE_HEARTBEAT_TIMEOUT_MS),
+            "the badge must have given up before Temporal reassigns at {BADGE_HEARTBEAT_TIMEOUT_MS} ms"
+        );
     }
 
     #[test]

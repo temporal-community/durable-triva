@@ -22,7 +22,10 @@ fn read_optional_env(path: &Path) -> HashMap<String, String> {
     }
 }
 
-fn config_path(variable: &str, local: PathBuf, legacy: PathBuf) -> PathBuf {
+/// Resolves one configuration file: an explicit environment override wins and
+/// must exist, otherwise the first candidate that does. Falls back to the last
+/// candidate so a missing file is reported under its documented name.
+fn config_path(variable: &str, candidates: &[PathBuf]) -> PathBuf {
     println!("cargo:rerun-if-env-changed={variable}");
     if let Some(path) = env::var_os(variable).map(PathBuf::from) {
         assert!(
@@ -32,7 +35,12 @@ fn config_path(variable: &str, local: PathBuf, legacy: PathBuf) -> PathBuf {
         );
         return path;
     }
-    if local.is_file() { local } else { legacy }
+    let last = candidates.last().expect("at least one candidate path");
+    candidates
+        .iter()
+        .find(|candidate| candidate.is_file())
+        .unwrap_or(last)
+        .clone()
 }
 
 fn main() {
@@ -46,18 +54,13 @@ fn main() {
     let project = firmware
         .parent()
         .expect("firmware is inside the repository");
-    let wifi_path = config_path(
-        "BADGE_WIFI_ENV_FILE",
-        firmware.join(".env.wifi"),
-        firmware.join(".env.wifi"),
-    );
+    let wifi_path = config_path("BADGE_WIFI_ENV_FILE", &[firmware.join(".env.wifi")]);
     // The repo's own .env, else .env.temporal. There is deliberately no
     // fallback outside the repository: an absolute path belongs in
     // TEMPORAL_ENV_FILE, which config_path asserts actually exists.
     let temporal_path = config_path(
         "TEMPORAL_ENV_FILE",
-        project.join(".env"),
-        project.join(".env.temporal"),
+        &[project.join(".env"), project.join(".env.temporal")],
     );
     println!("cargo:rerun-if-changed={}", wifi_path.display());
     println!("cargo:rerun-if-changed={}", temporal_path.display());

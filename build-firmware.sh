@@ -75,3 +75,24 @@ if ! strings "$firmware_elf" | grep -Fqx "$firmware_version"; then
     exit 1
 fi
 echo "verified embedded firmware version: $firmware_version"
+
+# The HIL reader can inject a correct answer into a live round, so the image
+# people carry must not contain it. Assert the gate rather than trusting it.
+case " $* " in
+    *" hil"*) hil_expected=1 ;;
+    *) hil_expected=0 ;;
+esac
+if strings "$firmware_elf" | grep -Fq "HIL ACK answer="; then
+    hil_embedded=1
+else
+    hil_embedded=0
+fi
+if [ "$hil_embedded" != "$hil_expected" ]; then
+    echo "firmware HIL gating mismatch: expected hil=$hil_expected, image has hil=$hil_embedded" >&2
+    exit 1
+fi
+if [ "$hil_embedded" = 1 ]; then
+    echo "verified embedded HIL test protocol: acceptance build, do not hand this badge out"
+else
+    echo "verified no HIL test protocol in the image"
+fi

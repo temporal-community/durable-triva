@@ -1,10 +1,9 @@
 # Web controller and scoreboard
 
 This directory contains the Rust Temporal Workflow Worker, Axum operator
-server, trivia deck, fixed 16:9 scoreboard, phone UI/API, and serverless phone
-Activity Worker. The controller starts rounds, schedules question Activities
-for badges and phones, observes durable game state, and serves the operator UI
-at `127.0.0.1:3000`.
+server, trivia deck, fixed 16:9 scoreboard, and the badge simulator. The
+controller starts rounds, schedules question Activities for badges, observes
+durable game state, and serves the operator UI at `127.0.0.1:3000`.
 
 The controller polls Workflow Tasks on the same
 `temporal-trivia-badges-v1` Task Queue used by badge Activity Workers. Each
@@ -57,6 +56,11 @@ can claim later work, but the badge target is fixed from the roster detected at
 round start. A heartbeat retry may wait briefly for a Worker instead of keeping
 a healthy badge idle throughout normal play.
 
+Rust-only scheduling deals no other category, so when the deck runs out of Rust
+cards the Workflow recycles it into a fresh cycle rather than dealing nothing.
+The change is behind the `eligible-deck-refill-v1` patch marker, so histories
+written before it replay their recorded command sequence.
+
 Open the operator tray with the small **TP7** test pad in the bottom-right
 corner or the `O` keyboard shortcut. It rises from the bottom edge and the
 lanes compress upward, so every score stays visible while an Update lands. Its
@@ -108,63 +112,11 @@ git diff --check
 
 The question-pool tests verify the category mix, badge-size constraints, unique
 questions, and answer indexes. Workflow tests cover durable timing, chaos
-Signals, retry scheduling, and shared payload validation.
+Signals, retry scheduling, deck recycling under Rust-only, and shared payload
+validation.
+
+Prefer `./check-host.sh` from the repository root, which runs all of the above
+with the host target and the stable toolchain already supplied.
 
 See the root [game specification](../GAME_SPEC.md) for scoring and retry rules
 and the [engineering journal](../blog.md) for live recovery validation.
-
-## Phone players
-
-The public phone path has two Rust processes:
-
-- `phone_api` serves the portrait UI and turns browser heartbeats and answers
-  into asynchronous Activity heartbeats/completions.
-- `phone_worker` polls `temporal-trivia-phones-v1`, signals the durable
-  assignment into the Game Workflow, then returns `WillCompleteAsync`.
-
-The API refreshes all phone assignments with one batched Workflow query every
-250 ms. Individual browser polls read that disposable cache, while the Game
-Workflow remains the source of truth. Restarting the API repopulates the cache
-from Temporal; no database is required.
-
-Run both processes from the repository root:
-
-```sh
-./run-phone-api.sh
-./run-phone-worker.sh
-```
-
-Set `PUBLIC_BASE_URL` when starting the controller so the TV QR targets the
-public phone service. Production HTTPS uses a Secure cookie by default; the
-local launcher sets `PHONE_COOKIE_SECURE=0` for HTTP localhost.
-
-The eventual Worker Versioning demo is deliberately deferred. It will be a
-terminal-triggered deployment step, not an operator UI control, after the
-basic Cloud Run deployment is validated.
-
-## Cloud Run container
-
-The root `Dockerfile` builds both Rust binaries. Its default command runs the
-public API; deploy the same immutable image to a Worker Pool with the command
-overridden to `/usr/local/bin/phone_worker`.
-
-```sh
-gcloud builds submit --tag REGION-docker.pkg.dev/PROJECT/REPOSITORY/durable-trivia-phone .
-
-gcloud run deploy durable-trivia-phone \
-  --image REGION-docker.pkg.dev/PROJECT/REPOSITORY/durable-trivia-phone \
-  --region REGION --allow-unauthenticated \
-  --set-env-vars TEMPORAL_ADDRESS=ADDRESS,TEMPORAL_NAMESPACE=NAMESPACE \
-  --set-secrets TEMPORAL_API_KEY=temporal-api-key:latest
-
-gcloud run worker-pools deploy durable-trivia-phone-worker \
-  --image REGION-docker.pkg.dev/PROJECT/REPOSITORY/durable-trivia-phone \
-  --region REGION --instances 1 --command /usr/local/bin/phone_worker \
-  --set-env-vars TEMPORAL_ADDRESS=ADDRESS,TEMPORAL_NAMESPACE=NAMESPACE \
-  --set-secrets TEMPORAL_API_KEY=temporal-api-key:latest
-```
-
-Cloud Run Worker Pools use a fixed instance count rather than request-driven
-autoscaling. Keep one warm instance for the stage and booth demo. Put the
-Temporal API key in Secret Manager rather than a checked-in env file or shell
-history.

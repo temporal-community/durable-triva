@@ -99,21 +99,50 @@ class BadgePort:
                     )
                 self._condition.wait(timeout=min(remaining, 0.5))
 
-    def identify(self, timeout: float) -> str:
-        """Ask firmware for its stable callsign and return it."""
+    def status(self, timeout: float) -> re.Match[str]:
+        """Ask firmware for one fresh HIL STATUS line and return its fields."""
         deadline = time.monotonic() + timeout
-        marker = self.mark()
         while time.monotonic() < deadline:
+            marker = self.mark()
             self.send("HIL STATUS")
             try:
-                line = self.wait_for(r"HIL STATUS callsign=([^ ]+)", 1.0, after=marker)
+                line = self.wait_for(r"HIL STATUS callsign=", 1.0, after=marker)
             except TimeoutError:
                 continue
-            match = re.search(r"callsign=([^ ]+)", line)
+            match = re.search(
+                r"callsign=(?P<callsign>[^ ]+) polling=(?P<polling>\S+) "
+                r"active=(?P<active>\S+) question=(?P<question>\S+)",
+                line,
+            )
             if match is not None:
-                self.callsign = match.group(1)
-                return self.callsign
+                self.callsign = match.group("callsign")
+                return match
         raise TimeoutError(f"{self.path}: badge did not answer HIL STATUS")
+
+    def identify(self, timeout: float) -> str:
+        """Ask firmware for its stable callsign and return it."""
+        return cast(str, self.status(timeout).group("callsign"))
+
+    def await_polling(self, timeout: float) -> None:
+        """Block until this badge's Temporal Worker reports that it is polling.
+
+        Readiness is asked for rather than inferred from the boot log: that
+        line is printed once, and the runner deliberately opens the port
+        without toggling reset, so on a badge that was already running it has
+        long since scrolled past.
+        """
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self.status(min(5.0, timeout)).group("polling") == "true":
+                return
+            time.sleep(0.25)
+        raise TimeoutError(
+            f"{self.callsign or self.path}: Worker never reported polling"
+        )
+
+    def owns_question(self) -> bool:
+        """Whether this badge is holding a question right now."""
+        return self.status(5.0).group("active") == "true"
 
     def _read_lines(self) -> None:
         while not self._stop.is_set():
@@ -168,6 +197,31 @@ def discover_ports(explicit_ports: list[str]) -> list[str]:
             f"expected exactly two distinct badge ports, found {len(ports)}: {ports}"
         )
     return ports
+
+
+def wait_for_scheduler_roster(
+    controller: str, callsigns: list[str], timeout: float
+) -> None:
+    """Wait until the controller lists both callsigns as polling Workers.
+
+    A badge reporting ``polling=true`` has only started its Worker task. The
+    round is sized from Temporal's own poller list, which lags behind that by
+    a few seconds -- so starting on the firmware flag alone produces a round
+    that schedules nothing, or schedules for one badge out of two.
+    """
+    deadline = time.monotonic() + timeout
+    wanted = set(callsigns)
+    seen: set[str] = set()
+    while time.monotonic() < deadline:
+        roster = request_json(controller, "/api/badges")
+        listed = roster.get("callsigns")
+        seen = set(listed) if isinstance(listed, list) else set()
+        if wanted <= seen:
+            return
+        time.sleep(0.5)
+    raise TimeoutError(
+        f"controller never listed both badges as polling: wanted {sorted(wanted)}, saw {sorted(seen)}"
+    )
 
 
 def player_correct_count(state: dict[str, JsonValue], callsign: str) -> int:
@@ -226,8 +280,11 @@ def run_test(
         print(f"HIL identified physical badges: {', '.join(callsigns)}")
 
         for badge in badges:
-            badge.wait_for(r"Polling trivia queue", timeout)
-        print("HIL both physical Workers are polling Temporal")
+            badge.await_polling(timeout)
+        print("HIL both physical badge Workers report polling")
+
+        wait_for_scheduler_roster(controller, callsigns, timeout)
+        print("HIL controller lists both badges; the round will be sized for two")
 
         markers = {badge.path: badge.mark() for badge in badges}
         start_payload: dict[str, JsonValue] = {}
@@ -243,6 +300,15 @@ def run_test(
                 r"Question .* preparation complete",
                 timeout,
                 after=markers[badge.path],
+            )
+        # Reaching that log line proves each badge held a question at some
+        # point, which two sequential ownerships also satisfy. Simultaneous
+        # ownership is the property a one-slot scheduler would fail, so ask
+        # both boards what they are holding right now.
+        if not all(badge.owns_question() for badge in badges):
+            raise RuntimeError(
+                "badges did not hold questions simultaneously; "
+                "the scheduler is not feeding every connected badge"
             )
         print("HIL both physical badges hold questions simultaneously")
 

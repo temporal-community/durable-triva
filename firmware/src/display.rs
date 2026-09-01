@@ -7,7 +7,7 @@
 use anyhow::{Context, Result, bail};
 use badge_screen::{Canvas, Status, WIDTH};
 use esp_idf_svc::hal::{
-    delay::BLOCK,
+    delay::TickType,
     gpio::{Gpio4, Gpio5},
     i2c::{I2C0, I2cConfig, I2cDriver},
     units::KiloHertz,
@@ -16,6 +16,14 @@ use esp_idf_svc::hal::{
 use crate::model::{ChaosCommand, GameSnapshot, Question};
 
 const ADDRESS: u8 = 0x3c;
+/// Every OLED write is bounded rather than waiting forever.
+///
+/// The badge runs one current-thread Tokio runtime, so an I2C transfer that
+/// never returns does not merely freeze the screen -- it stops the Activity
+/// heartbeat loop, the Worker poller and the sleep monitor with it, and only a
+/// reset recovers. A stuck bus is a real prospect on a badge people carry;
+/// 50 ms is far more than the ~0.4 ms a 17-byte write needs at 400 kHz.
+const WRITE_TIMEOUT: TickType = TickType::new_millis(50);
 /// The SSD1306 accepts a control byte plus payload per write.
 const MAX_PACKET: usize = 32;
 const FRAME_CHUNK: usize = 16;
@@ -110,7 +118,7 @@ impl BadgeDisplay {
         let mut packet = [0_u8; MAX_PACKET];
         packet[1..packet_len].copy_from_slice(commands);
         self.i2c
-            .write(ADDRESS, &packet[..packet_len], BLOCK)
+            .write(ADDRESS, &packet[..packet_len], WRITE_TIMEOUT.ticks())
             .context("write OLED command")?;
         Ok(())
     }
@@ -123,7 +131,7 @@ impl BadgeDisplay {
             packet[0] = 0x40;
             packet[1..].copy_from_slice(chunk);
             self.i2c
-                .write(ADDRESS, &packet, BLOCK)
+                .write(ADDRESS, &packet, WRITE_TIMEOUT.ticks())
                 .context("write OLED framebuffer chunk")?;
         }
         Ok(())

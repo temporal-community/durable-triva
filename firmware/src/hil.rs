@@ -17,6 +17,12 @@ const MAX_COMMAND_BYTES: usize = 96;
 
 /// Starts the USB-local hardware-in-the-loop command reader.
 ///
+/// Compiled only under the non-default `hil` feature. `HIL ANSWER CORRECT`
+/// reads the correct index out of the question this badge is holding, so a
+/// shipped badge that carries this reader is a badge anyone with a USB cable
+/// can win a round on. `tools/test_physical_badges.py` needs it; the badge
+/// handed to an attendee must not have it.
+///
 /// Commands are accepted only while this physical badge owns a question:
 /// `HIL ANSWER CORRECT` selects the question's known correct index, while
 /// `HIL ANSWER 0` through `3` exercise an explicit directional mapping.
@@ -24,11 +30,24 @@ pub fn start(
     input: Arc<Mutex<BadgeInput>>,
     activity_active: Arc<AtomicBool>,
     current_question: Arc<Mutex<Option<QuestionTask>>>,
+    worker_polling: Arc<AtomicBool>,
     callsign: String,
 ) -> Result<()> {
     thread::Builder::new()
         .name("usb-hil".to_owned())
-        .spawn(move || read_commands(input, activity_active, current_question, callsign))
+        // Formatting a log line through esp_log costs more than the 3 KiB
+        // ESP-IDF gives a pthread by default, and a stack overflow here is a
+        // reboot in the middle of an acceptance run.
+        .stack_size(8 * 1024)
+        .spawn(move || {
+            read_commands(
+                input,
+                activity_active,
+                current_question,
+                worker_polling,
+                callsign,
+            )
+        })
         .context("start USB HIL command reader")?;
     Ok(())
 }
@@ -37,6 +56,7 @@ fn read_commands(
     input: Arc<Mutex<BadgeInput>>,
     activity_active: Arc<AtomicBool>,
     current_question: Arc<Mutex<Option<QuestionTask>>>,
+    worker_polling: Arc<AtomicBool>,
     callsign: String,
 ) {
     let stdin = std::io::stdin();
@@ -57,6 +77,7 @@ fn read_commands(
                                     &input,
                                     &activity_active,
                                     &current_question,
+                                    &worker_polling,
                                     &callsign,
                                 );
                             } else {
@@ -86,6 +107,7 @@ fn handle_command(
     input: &Arc<Mutex<BadgeInput>>,
     activity_active: &Arc<AtomicBool>,
     current_question: &Arc<Mutex<Option<QuestionTask>>>,
+    worker_polling: &Arc<AtomicBool>,
     callsign: &str,
 ) {
     if line == "HIL STATUS" {
@@ -94,9 +116,13 @@ fn handle_command(
             .ok()
             .and_then(|question| question.as_ref().map(|task| task.question.id.clone()))
             .unwrap_or_else(|| "none".to_owned());
+        // `polling` is reported here because it is the only readiness signal a
+        // runner can ask for. The boot log line it replaced is printed once,
+        // so a port opened without resetting the badge never sees it.
         log::info!(
-            "HIL STATUS callsign={} active={} question={}",
+            "HIL STATUS callsign={} polling={} active={} question={}",
             callsign,
+            worker_polling.load(Ordering::Acquire),
             activity_active.load(Ordering::Acquire),
             question_id
         );

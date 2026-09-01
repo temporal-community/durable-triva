@@ -11,6 +11,13 @@ pub struct BadgeInput {
     // GPIO0 is fixed by the badge PCB. Holding LEFT while resetting can select
     // the ESP ROM bootloader, so release it before power-up or reset.
     left: PinDriver<'static, Input>,
+    /// Gestures queued by the USB HIL reader, sampled ahead of the real pins.
+    ///
+    /// Only `inject_answer` fills this, and that is gated on the `hil` feature,
+    /// so in the image people carry the queue exists but nothing can ever put
+    /// anything in it. `sample` is deliberately left identical in both builds:
+    /// it runs on the badge's one runtime thread every 20 ms and is not worth
+    /// giving two shapes.
     injected: VecDeque<Buttons>,
 }
 
@@ -30,6 +37,7 @@ impl BadgeInput {
         })
     }
 
+    #[cfg(feature = "hil")]
     pub fn inject_answer(&mut self, index: u8) -> bool {
         let Some(gesture) = badge_input::answer_gesture(index) else {
             return false;

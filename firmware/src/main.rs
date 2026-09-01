@@ -1,5 +1,6 @@
 mod display;
 mod haptics;
+#[cfg(feature = "hil")]
 mod hil;
 mod identity;
 mod input;
@@ -12,7 +13,7 @@ use std::{
     str::FromStr,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicI32, Ordering},
+        atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -33,7 +34,7 @@ use esp_idf_svc::{
 use rustls::{RootCertStore, client::WebPkiServerVerifier};
 use temporalio_client::{
     ActivityIdentifier, Client, ClientOptions, Connection, ConnectionOptions, RpcOptions,
-    TlsOptions, WorkflowQueryOptions, WorkflowSignalOptions,
+    TlsOptions, WorkflowQueryOptions, WorkflowSignalOptions, errors::AsyncActivityError,
 };
 use temporalio_common::{protos::TaskToken, worker::WorkerDeploymentOptions};
 use temporalio_macros::{activities, workflow, workflow_methods};
@@ -55,7 +56,7 @@ use crate::{
     input::BadgeInput,
     model::{
         BADGE_CRASH_BLACKOUT_MS, BADGE_HEARTBEAT_INTERVAL_MS, BADGE_TASK_QUEUE, BadgeAnswer,
-        BadgeEvent, GameInput, GameSnapshot, QuestionTask,
+        BadgeEvent, GameInput, GameSnapshot, QuestionTask, heartbeat_budget_exhausted,
     },
     session::SessionStore,
 };
@@ -66,6 +67,16 @@ const WORKER_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 const MAX_ACTIVITY_RUNTIME: Duration = Duration::from_secs(120);
 const POWERUP_OVERLAY: Duration = Duration::from_millis(1_500);
 const POWERUP_FRESHNESS_MS: u64 = 5_000;
+/// How often a badge asks the Workflow whether a power-up has landed.
+///
+/// This runs on the same single-threaded runtime as the Activity poller, over
+/// TLS, forever. At 500 ms it was two Cloud queries a second competing with
+/// the poll that actually delivers questions, and the first question of a
+/// round took as long as sixteen seconds to reach a badge. One second still
+/// beats the 1.5 s overlay it drives, and between rounds there is no power-up
+/// to miss -- only a question to be ready for.
+const POWERUP_POLL_ACTIVE: Duration = Duration::from_millis(1_000);
+const POWERUP_POLL_IDLE: Duration = Duration::from_millis(4_000);
 /// Long enough to read the verdict before the waiting screen returns.
 const FEEDBACK_HOLD: Duration = Duration::from_millis(1_100);
 const GAME_SIGNAL_TIMEOUT: Duration = Duration::from_millis(750);
@@ -77,6 +88,23 @@ const RESULT_WATCH_POLLS: u32 = 45;
 /// Keep final standings readable, then make an idle badge visibly ready for
 /// the next round instead of leaving stale results on screen.
 const RESULT_HOLD: Duration = Duration::from_secs(5);
+/// How long the watcher keeps trying to hand the screen back after its hold.
+///
+/// The Activity from a finished round can outlive its Workflow briefly, and it
+/// owns the screen while it does. One attempt at the end of the hold could
+/// therefore find the badge busy, skip the restore and leave the final
+/// standings up for good.
+const RESULT_RESTORE_POLLS: u32 = 20;
+const RESULT_RESTORE_INTERVAL: Duration = Duration::from_millis(500);
+/// How long a badge waits before failing an Activity for a question it has
+/// already abandoned, so the retry has a moment to reach a different Worker.
+const ABANDONED_REFUSAL_BACKOFF: Duration = Duration::from_millis(250);
+/// How often to report an input path that has produced nothing.
+///
+/// A badge that silently ignores every press looks identical to one that is
+/// waiting for one. `SuppressedUntilRelease` and a stuck `powerup_active` both
+/// do exactly that, for the whole life of a question, and neither said a word.
+const INPUT_DIAGNOSTIC_INTERVAL: Duration = Duration::from_millis(2_000);
 
 type SharedDisplay = Arc<Mutex<BadgeDisplay>>;
 type SharedInput = Arc<Mutex<BadgeInput>>;
@@ -127,6 +155,57 @@ struct BadgeActivities {
     /// poller. The badge shows feedback before the Workflow scores the answer,
     /// so without this it would always claim 1 even under double points.
     point_value: Arc<AtomicI32>,
+}
+
+/// Heartbeats an Activity from its own task, so the input loop never waits on
+/// the network.
+///
+/// The loop used to `await` a gRPC round trip inline every second. `sample`
+/// reads the pins at an instant, so while that await was outstanding the badge
+/// was not merely slow to notice a press -- it could not see one at all. On a
+/// congested network that dropped physical presses outright and left the
+/// answer haptic trailing the button by however long Temporal took to answer.
+struct ActivityHeartbeat {
+    /// Temporal asked this attempt to stop.
+    stopped: Arc<AtomicBool>,
+    /// Milliseconds since `base` at the last acknowledged heartbeat.
+    ///
+    /// 32 bits because the Xtensa target has no 64-bit atomics, and an
+    /// Activity is capped at 95 seconds by schedule-to-close anyway.
+    last_ack_ms: Arc<AtomicU32>,
+    base: Instant,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl ActivityHeartbeat {
+    fn stopped(&self) -> bool {
+        self.stopped.load(Ordering::Acquire)
+    }
+
+    /// How long this attempt has gone without an acknowledged heartbeat.
+    fn silent_ms(&self) -> u64 {
+        let now = self.base.elapsed().as_millis() as u32;
+        u64::from(now.saturating_sub(self.last_ack_ms.load(Ordering::Acquire)))
+    }
+}
+
+impl Drop for ActivityHeartbeat {
+    /// Dropping stops the heartbeats. The deliberate crash relies on this:
+    /// it drops the monitor and then sleeps out the blackout in silence.
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// What one Activity heartbeat means for the attempt that sent it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Heartbeat {
+    /// Temporal acknowledged it; the attempt is alive.
+    Acknowledged,
+    /// The RPC did not land. Harmless until the budget runs out.
+    Missed,
+    /// Temporal told this attempt to stop.
+    Stopped,
 }
 
 struct ResultWatcher {
@@ -192,72 +271,61 @@ impl BadgeActivities {
         ctx: ActivityContext,
         task: QuestionTask,
     ) -> Result<BadgeAnswer, ActivityError> {
-        let _active = ActivityActiveGuard::new(Arc::clone(&self.activity_active));
-        let _current = CurrentQuestionGuard::new(Arc::clone(&self.current_question), task.clone())?;
         log::info!(
             "Question {} attempt {} heartbeat timeout {:?}",
             task.question.id,
             ctx.info().attempt,
             ctx.info().heartbeat_timeout
         );
-        // The Activity payload already contains everything needed to draw the
-        // question. Do that before NVS or Cloud telemetry so a slow Signal can
-        // never make a newly assigned badge look frozen.
-        show_question(&self.display, &self.identity.callsign, &task)?;
-        Self::record_activity_heartbeat(&ctx).await?;
-        self.session
-            .begin_game(&task.game_id, task.deadline_unix_ms)?;
-        self.start_result_watcher(&ctx, &task)?;
-        Self::record_activity_heartbeat(&ctx).await?;
-
         let event = BadgeEvent {
             badge_id: self.identity.id.clone(),
             callsign: self.identity.callsign.clone(),
             question_id: task.question.id.clone(),
             attempt: ctx.info().attempt,
         };
-        if let Some(handle) = ctx.workflow_handle::<GameWorkflow>() {
-            // This Signal is observational telemetry, not part of accepting an
-            // answer. Keep it off the Activity's heartbeat-critical path: on
-            // the ESP32 runtime an unhealthy Signal has outlived its local
-            // timeout and allowed the server heartbeat timeout to expire.
-            let start_event = event.clone();
-            tokio::spawn(async move {
-                match tokio::time::timeout(
-                    GAME_SIGNAL_TIMEOUT,
-                    handle.signal(
-                        GameWorkflow::badge_started,
-                        start_event,
-                        WorkflowSignalOptions::default(),
-                    ),
-                )
-                .await
-                {
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) => log::warn!("could not signal badge start: {error}"),
-                    Err(_) => {
-                        log::warn!("badge start Signal exceeded 750 ms; continuing Activity")
-                    }
-                }
-            });
-        }
-        Self::record_activity_heartbeat(&ctx).await?;
 
-        // Report every real Temporal attempt before this Worker refuses a
-        // question it already abandoned. That keeps the public attempt count
-        // aligned with ActivityContext even when the same badge polls a retry.
+        // Refuse an abandoned question before anything is drawn, written or
+        // awaited. A badge leaving its crash blackout is the freest poller on
+        // the queue and so the likeliest to be handed its own abandoned
+        // question back; drawing it would flash a question the player can
+        // never answer, and the NVS write and heartbeat RPCs behind it were
+        // three Cloud round trips spent to say no. The Signal still reports
+        // the attempt, but it is spawned and costs this path nothing.
         if self
             .session
             .is_abandoned(&task.game_id, &task.question.id)?
         {
-            tokio::time::sleep(Duration::from_millis(250)).await;
+            self.signal_badge_started(&ctx, event);
+            log::warn!(
+                "Refusing abandoned question {}; leaving it for another Worker",
+                task.question.id
+            );
+            tokio::time::sleep(ABANDONED_REFUSAL_BACKOFF).await;
             return Err(anyhow!("badge already abandoned this question").into());
         }
+
+        let _active = ActivityActiveGuard::new(Arc::clone(&self.activity_active));
+        let _current = CurrentQuestionGuard::new(Arc::clone(&self.current_question), task.clone())?;
+        // Retire a watcher still holding the previous round's standings before
+        // anything is drawn. It restores the waiting screen when its hold ends,
+        // and the heartbeat and NVS writes below are long enough for that to
+        // land on top of a question this Activity had already painted.
+        self.start_result_watcher(&ctx, &task)?;
+        // The Activity payload already contains everything needed to draw the
+        // question. Do that before NVS or Cloud telemetry so a slow Signal can
+        // never make a newly assigned badge look frozen.
+        show_question(&self.display, &self.identity.callsign, &task)?;
+        // From here until this Activity lets go, heartbeats are somebody
+        // else's job. Nothing below may block on the network.
+        let heartbeat = Self::spawn_heartbeat(&ctx);
+        self.session
+            .begin_game(&task.game_id, task.deadline_unix_ms)?;
+        self.signal_badge_started(&ctx, event.clone());
         log::info!("Question {} preparation complete", task.question.id);
 
         let activity_deadline_unix_ms = task.latest_possible_deadline_unix_ms();
         match self
-            .wait_for_choice(&ctx, activity_deadline_unix_ms)
+            .wait_for_choice(&ctx, &heartbeat, activity_deadline_unix_ms)
             .await?
         {
             Choice::Answer(selected_index) => {
@@ -297,6 +365,10 @@ impl BadgeActivities {
                 Ok(answer)
             }
             Choice::Panic => {
+                // Stop heartbeating before anything else: this is the whole
+                // point of the gesture, and the blackout below has to outlast
+                // Temporal's timeout in silence.
+                drop(heartbeat);
                 self.session.abandon(&task.game_id, &task.question.id)?;
                 show_panic(&self.display, &self.identity.callsign)?;
                 haptics::play(&self.haptics, HapticEvent::Crash).await;
@@ -353,25 +425,34 @@ impl BadgeActivities {
     async fn wait_for_choice(
         &self,
         ctx: &ActivityContext,
+        heartbeat: &ActivityHeartbeat,
         deadline_unix_ms: u64,
     ) -> Result<Choice, ActivityError> {
         // Temporal cancellation and the Workflow deadline remain authoritative.
         // This monotonic ceiling prevents a stale build-time clock fallback from
         // leaving the physical badge stuck in an Activity indefinitely.
         let local_deadline = Instant::now() + MAX_ACTIVITY_RUNTIME;
-        let mut state = if self.sample_buttons()?.any() {
+        let opening_buttons = self.sample_buttons()?;
+        let mut state = if opening_buttons.any() {
             // A press already in progress belongs to the previous screen. Keep
             // suppressing it until release, but remain inside the heartbeat
             // loop so a held or electrically stuck button cannot make a
             // healthy Worker look dead to Temporal.
+            log::warn!(
+                "Buttons already down as attempt {} opened ({opening_buttons:?}); input is suppressed until every button is released",
+                ctx.info().attempt
+            );
             ButtonState::SuppressedUntilRelease
         } else {
             ButtonState::default()
         };
-        let heartbeat_interval = Duration::from_millis(BADGE_HEARTBEAT_INTERVAL_MS);
-        let mut last_heartbeat = Instant::now()
-            .checked_sub(heartbeat_interval)
-            .unwrap_or_else(Instant::now);
+        let opened_at = Instant::now();
+        let mut last_diagnostic = Instant::now();
+        // The loop is supposed to run at 50 Hz. Counting its turns is the only
+        // way to tell "the badge never saw your press" apart from "the badge
+        // was never scheduled to look" -- and those have opposite fixes.
+        let mut ticks = 0_u32;
+        let mut presses_seen = 0_u32;
         loop {
             if ctx.is_cancelled() {
                 log::warn!(
@@ -397,16 +478,39 @@ impl BadgeActivities {
                 );
                 return Err(ActivityError::cancelled());
             }
-            if last_heartbeat.elapsed() >= heartbeat_interval {
-                Self::record_activity_heartbeat(ctx).await?;
-                last_heartbeat = Instant::now();
+            if heartbeat.stopped() {
+                return Err(ActivityError::cancelled());
             }
-            let (next, choice) = state.advance(
-                self.sample_buttons()?,
-                self.powerup_active.load(Ordering::Acquire),
-                Instant::now(),
-                PANIC_HOLD,
-            );
+            let silent_ms = heartbeat.silent_ms();
+            if heartbeat_budget_exhausted(silent_ms) {
+                log::error!(
+                    "no Activity heartbeat acknowledged for {silent_ms} ms; giving up attempt {}",
+                    ctx.info().attempt
+                );
+                return Err(
+                    anyhow!("no Activity heartbeat acknowledged for {silent_ms} ms").into(),
+                );
+            }
+            let buttons = self.sample_buttons()?;
+            let powerup_active = self.powerup_active.load(Ordering::Acquire);
+            ticks += 1;
+            if buttons.any() {
+                presses_seen += 1;
+            }
+            // Report unconditionally: a loop that is running and seeing
+            // nothing looks exactly like one that is not running at all, and
+            // only the tick rate separates them. ~100 ticks per report is
+            // healthy; far fewer means the runtime is starving this loop.
+            if last_diagnostic.elapsed() >= INPUT_DIAGNOSTIC_INTERVAL {
+                last_diagnostic = Instant::now();
+                log::warn!(
+                    "Input idle {} ms into attempt {}: state={state:?} buttons={buttons:?} powerup={powerup_active} ticks={ticks} presses_seen={presses_seen} silent_hb={} ms",
+                    opened_at.elapsed().as_millis(),
+                    ctx.info().attempt,
+                    heartbeat.silent_ms()
+                );
+            }
+            let (next, choice) = state.advance(buttons, powerup_active, Instant::now(), PANIC_HOLD);
             state = next;
             if let Some(choice) = choice {
                 return Ok(choice);
@@ -423,13 +527,17 @@ impl BadgeActivities {
             .sample())
     }
 
-    async fn record_activity_heartbeat(ctx: &ActivityContext) -> Result<(), ActivityError> {
+    /// Sends one heartbeat and reports what it means, without deciding
+    /// anything. Only the caller knows how long this attempt has already gone
+    /// unacknowledged, and that is what a missed RPC has to be judged against.
+    async fn heartbeat_once(ctx: &ActivityContext) -> Heartbeat {
         // Keep Core's local Activity heartbeat state current. On ESP32, the
         // queued Worker path alone has not reliably reached Temporal before
         // the server timeout, even with a one-second throttle.
-        ctx.record_heartbeat(())
-            .await
-            .map_err(|error| anyhow!("could not encode Activity heartbeat: {error}"))?;
+        if let Err(error) = ctx.record_heartbeat(()).await {
+            log::warn!("could not encode Activity heartbeat: {error}");
+            return Heartbeat::Missed;
+        }
 
         // Await a direct server acknowledgement as well. This prevents a lost
         // Core-to-server heartbeat path from looking healthy until Temporal
@@ -441,9 +549,20 @@ impl BadgeActivities {
             )));
         let response = match handle.heartbeat(Some(()), RpcOptions::default()).await {
             Ok(response) => response,
+            // Definitive, not transient: the Activity has completed, been
+            // cancelled, or its Workflow has closed. Spending the whole
+            // tolerance budget on a question that no longer exists just leaves
+            // it on screen for another ten seconds.
+            Err(AsyncActivityError::NotFound(status)) => {
+                log::info!(
+                    "Activity attempt {} is no longer known to Temporal: {status}",
+                    ctx.info().attempt
+                );
+                return Heartbeat::Stopped;
+            }
             Err(error) => {
-                log::error!("Activity heartbeat RPC failed: {error}");
-                return Err(anyhow!("Activity heartbeat RPC failed: {error}").into());
+                log::warn!("Activity heartbeat RPC failed: {error}");
+                return Heartbeat::Missed;
             }
         };
         if response.cancel_requested || response.activity_paused || response.activity_reset {
@@ -454,9 +573,77 @@ impl BadgeActivities {
                 response.activity_paused,
                 response.activity_reset
             );
-            return Err(ActivityError::cancelled());
+            return Heartbeat::Stopped;
         }
-        Ok(())
+        Heartbeat::Acknowledged
+    }
+
+    /// Starts heartbeating this attempt on its own task.
+    ///
+    /// The returned handle stops the heartbeats when it is dropped, which is
+    /// what makes the deliberate crash gesture silent.
+    fn spawn_heartbeat(ctx: &ActivityContext) -> ActivityHeartbeat {
+        let stopped = Arc::new(AtomicBool::new(false));
+        let last_ack_ms = Arc::new(AtomicU32::new(0));
+        let base = Instant::now();
+        let task = tokio::spawn({
+            let ctx = ctx.clone();
+            let stopped = Arc::clone(&stopped);
+            let last_ack_ms = Arc::clone(&last_ack_ms);
+            async move {
+                loop {
+                    match Self::heartbeat_once(&ctx).await {
+                        Heartbeat::Acknowledged => {
+                            last_ack_ms.store(base.elapsed().as_millis() as u32, Ordering::Release)
+                        }
+                        // Judging a miss needs to know how long this attempt
+                        // has been silent overall, which is the input loop's
+                        // business. This task only reports.
+                        Heartbeat::Missed => {
+                            log::warn!("Activity heartbeat missed for {}", ctx.info().attempt);
+                        }
+                        Heartbeat::Stopped => {
+                            stopped.store(true, Ordering::Release);
+                            return;
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(BADGE_HEARTBEAT_INTERVAL_MS)).await;
+                }
+            }
+        });
+        ActivityHeartbeat {
+            stopped,
+            last_ack_ms,
+            base,
+            task,
+        }
+    }
+
+    /// Reports a real Temporal attempt to the Workflow, off the critical path.
+    ///
+    /// Observational telemetry, not part of accepting an answer: on the ESP32
+    /// runtime an unhealthy Signal has outlived its local timeout and let the
+    /// server heartbeat timeout expire behind it.
+    fn signal_badge_started(&self, ctx: &ActivityContext, event: BadgeEvent) {
+        let Some(handle) = ctx.workflow_handle::<GameWorkflow>() else {
+            return;
+        };
+        tokio::spawn(async move {
+            match tokio::time::timeout(
+                GAME_SIGNAL_TIMEOUT,
+                handle.signal(
+                    GameWorkflow::badge_started,
+                    event,
+                    WorkflowSignalOptions::default(),
+                ),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => log::warn!("could not signal badge start: {error}"),
+                Err(_) => log::warn!("badge start Signal exceeded 750 ms; continuing Activity"),
+            }
+        });
     }
 
     fn start_result_watcher(
@@ -482,11 +669,14 @@ impl BadgeActivities {
         }
         let display = Arc::clone(&self.display);
         let haptics = Arc::clone(&self.haptics);
+        let activity_active = Arc::clone(&self.activity_active);
         let identity = self.identity.clone();
         let deadline_unix_ms = task.deadline_unix_ms;
         let game_id = task.game_id.clone();
+        let watched_game_id = game_id.clone();
         let task = tokio::spawn(async move {
             let wait_ms = deadline_unix_ms.saturating_sub(unix_ms());
+            log::info!("Result watcher armed for {watched_game_id}; {wait_ms} ms to the deadline");
             tokio::time::sleep(Duration::from_millis(wait_ms)).await;
             for _ in 0..RESULT_WATCH_POLLS {
                 match handle
@@ -495,9 +685,14 @@ impl BadgeActivities {
                 {
                     Ok(snapshot) if snapshot.status == model::GameStatus::Finished => {
                         let won = snapshot.winners.contains(&identity.callsign);
-                        if let Ok(mut screen) = display.lock()
-                            && let Err(error) =
+                        log::info!(
+                            "Round {watched_game_id} finished; showing standings for {}",
+                            identity.callsign
+                        );
+                        if let Err(error) =
+                            with_display_if_idle(&display, &activity_active, |screen| {
                                 screen.show_results(&identity.callsign, &identity.id, &snapshot)
+                            })
                         {
                             log::error!("show final results: {error:#}");
                         }
@@ -511,13 +706,40 @@ impl BadgeActivities {
                         )
                         .await;
                         tokio::time::sleep(RESULT_HOLD).await;
-                        match show_waiting(&display, &identity.callsign) {
-                            Ok(()) => log::info!(
-                                "Result hold complete; {} returned to waiting",
-                                identity.callsign
-                            ),
-                            Err(error) => log::error!("restore waiting screen: {error:#}"),
+                        // Keep offering the screen back until the round's own
+                        // Activity lets go. The ownership check still refuses
+                        // to paint over a question from a newer round, which
+                        // is the case this whole check exists for.
+                        for attempt in 0..RESULT_RESTORE_POLLS {
+                            match with_display_if_idle(&display, &activity_active, |screen| {
+                                screen.show_waiting(&identity.callsign)
+                            }) {
+                                Ok(true) => {
+                                    log::info!(
+                                        "Result hold complete; {} returned to waiting",
+                                        identity.callsign
+                                    );
+                                    return;
+                                }
+                                Ok(false) => {
+                                    if attempt == 0 {
+                                        log::info!(
+                                            "{} still owns the screen; waiting to restore",
+                                            identity.callsign
+                                        );
+                                    }
+                                    tokio::time::sleep(RESULT_RESTORE_INTERVAL).await;
+                                }
+                                Err(error) => {
+                                    log::error!("restore waiting screen: {error:#}");
+                                    return;
+                                }
+                            }
                         }
+                        log::warn!(
+                            "Result hold complete; {} is still holding a question, leaving it alone",
+                            identity.callsign
+                        );
                         return;
                     }
                     Ok(_) => {}
@@ -525,9 +747,13 @@ impl BadgeActivities {
                 }
                 tokio::time::sleep(RESULT_WATCH_INTERVAL).await;
             }
-            if let Ok(mut screen) = display.lock() {
-                let _ = screen.show_status(&identity.callsign, Status::ResultPending);
-            }
+            log::warn!(
+                "No final standings for {} after {RESULT_WATCH_POLLS} polls; showing RESULT PENDING",
+                identity.callsign
+            );
+            let _ = with_display_if_idle(&display, &activity_active, |screen| {
+                screen.show_status(&identity.callsign, Status::ResultPending)
+            });
         });
         *watcher = Some(ResultWatcher { game_id, task });
         Ok(())
@@ -650,14 +876,20 @@ async fn run_worker(
             current_question: Arc::clone(&current_question),
         })
         .build();
+    // T14: the acceptance runner needs to know this Worker is polling. It
+    // used to wait for the boot log line below, which is printed once and is
+    // therefore already gone when a port is opened without resetting the badge.
+    let worker_polling = Arc::new(AtomicBool::new(false));
     let powerup_client = client.clone();
     let mut worker = Worker::new(&sdk_runtime, client, worker_options)
         .map_err(|error| anyhow!(error.to_string()))?;
     show_waiting(&display, &identity.callsign)?;
+    #[cfg(feature = "hil")]
     hil::start(
         Arc::clone(&input),
         Arc::clone(&activity_active),
         Arc::clone(&current_question),
+        Arc::clone(&worker_polling),
         identity.callsign.clone(),
     )?;
     let sleep_display = Arc::clone(&display);
@@ -695,6 +927,7 @@ async fn run_worker(
         }
     });
     log::info!("Polling trivia queue {BADGE_TASK_QUEUE} as {worker_identity}");
+    worker_polling.store(true, Ordering::Release);
     worker.run().await?;
     Ok(())
 }
@@ -712,6 +945,7 @@ async fn monitor_powerups(
     let mut game_id = None;
     let mut sequence = 0;
     let mut consecutive_errors = 0_u32;
+    let mut poll_interval = POWERUP_POLL_IDLE;
     loop {
         match handle
             .query(GameWorkflow::snapshot, (), WorkflowQueryOptions::default())
@@ -719,15 +953,21 @@ async fn monitor_powerups(
         {
             Err(error) => {
                 consecutive_errors = consecutive_errors.saturating_add(1);
-                // Every 120th is once a minute at the 500 ms poll interval.
-                // Silence here is what made a badge that had lost Temporal
-                // look identical to one with no power-ups to show.
-                if consecutive_errors == 1 || consecutive_errors.is_multiple_of(120) {
+                // Roughly once a minute at either poll interval. Silence here
+                // is what made a badge that had lost Temporal look identical
+                // to one with no power-ups to show.
+                if consecutive_errors == 1 || consecutive_errors.is_multiple_of(60) {
                     log::warn!("power-up poll has failed {consecutive_errors} time(s): {error}");
                 }
+                poll_interval = POWERUP_POLL_IDLE;
             }
             Ok(snapshot) => {
                 consecutive_errors = 0;
+                poll_interval = if snapshot.status == model::GameStatus::Running {
+                    POWERUP_POLL_ACTIVE
+                } else {
+                    POWERUP_POLL_IDLE
+                };
                 let doubled = snapshot
                     .chaos
                     .double_points_until_unix_ms
@@ -772,7 +1012,7 @@ async fn monitor_powerups(
                 }
             }
         }
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        tokio::time::sleep(poll_interval).await;
     }
 }
 
@@ -797,6 +1037,28 @@ fn with_display<T>(
         .lock()
         .map_err(|_| anyhow!("display lock poisoned"))?;
     draw(&mut screen)
+}
+
+/// Runs one drawing call only while no Activity owns the screen.
+///
+/// Three tasks draw to one OLED: the Activity, the sleep monitor and the
+/// result watcher. Only the Activity may overwrite a live question, and the
+/// other two used to check `activity_active` before taking the display lock --
+/// which leaves a window where a question is drawn in between, and nothing
+/// ever redraws it. Checking under the lock closes that window. `Ok(false)`
+/// means the draw was correctly skipped, not that anything failed.
+pub(crate) fn with_display_if_idle(
+    display: &SharedDisplay,
+    activity_active: &AtomicBool,
+    draw: impl FnOnce(&mut BadgeDisplay) -> Result<()>,
+) -> Result<bool> {
+    let mut screen = display
+        .lock()
+        .map_err(|_| anyhow!("display lock poisoned"))?;
+    if activity_active.load(Ordering::Acquire) {
+        return Ok(false);
+    }
+    draw(&mut screen).map(|()| true)
 }
 
 fn show_status(display: &SharedDisplay, title: &str, status: Status) -> Result<()> {
