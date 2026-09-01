@@ -59,6 +59,8 @@ const INDEX_HTML: &str = include_str!("../static/index.html");
 // hashed and may change when a new controller binary is deployed.
 const ORBIT_RINGS_SVG: &[u8] = include_bytes!("../static/orbit-rings.svg");
 const ASTRONAUT_SVG: &[u8] = include_bytes!("../static/astronaut.svg");
+const TEMPORAL_LOGO_HORIZONTAL_LIGHT_SVG: &[u8] =
+    include_bytes!("../static/temporal-logo-horizontal-light.svg");
 const SPACE_GROTESK_TTF: &[u8] = include_bytes!("../static/space-grotesk.ttf");
 const SPACE_MONO_TTF: &[u8] = include_bytes!("../static/space-mono.ttf");
 const ASSET_CACHE_CONTROL: &str = "no-cache";
@@ -186,6 +188,10 @@ async fn main() -> Result<()> {
             .route("/", get(index))
             .route("/assets/orbit-rings.svg", get(orbit_rings_asset))
             .route("/assets/astronaut.svg", get(astronaut_asset))
+            .route(
+                "/assets/temporal-logo-horizontal-light.svg",
+                get(temporal_logo_horizontal_light_asset),
+            )
             .route("/assets/space-grotesk.ttf", get(space_grotesk_asset))
             .route("/assets/space-mono.ttf", get(space_mono_asset))
             .route("/assets/phone-qr.svg", get(phone_qr_asset))
@@ -237,6 +243,10 @@ async fn orbit_rings_asset() -> Response {
 
 async fn astronaut_asset() -> Response {
     asset("image/svg+xml", ASTRONAUT_SVG)
+}
+
+async fn temporal_logo_horizontal_light_asset() -> Response {
+    asset("image/svg+xml", TEMPORAL_LOGO_HORIZONTAL_LIGHT_SVG)
 }
 
 async fn space_grotesk_asset() -> Response {

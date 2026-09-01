@@ -4,6 +4,10 @@ set -eu
 project_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 generated_defaults="$project_dir/.sdkconfig.partition.defaults"
 next_defaults="$generated_defaults.next"
+build_metadata_dir="$project_dir/.firmware-build-metadata"
+version_file="$build_metadata_dir/version.txt"
+next_version_file="$version_file.next"
+version_tracking_stamp="$build_metadata_dir/native-version-tracking-v2"
 
 if [ -n "${ESP_GCC_DIR:-}" ]; then
     PATH="$ESP_GCC_DIR:$PATH"
@@ -30,6 +34,24 @@ if ! command -v ldproxy >/dev/null 2>&1; then
 fi
 export PATH
 
+mkdir -p "$build_metadata_dir"
+firmware_version=$(git -c core.fsmonitor=false describe --always --dirty)
+printf '%s\n' "$firmware_version" > "$next_version_file"
+if ! cmp -s "$next_version_file" "$version_file"; then
+    mv "$next_version_file" "$version_file"
+else
+    rm "$next_version_file"
+fi
+
+# Existing Cargo caches predate the tracked version file, so bootstrap them once.
+# After this clean build, esp-idf-sys watches version.txt and rebuilds only when
+# the Git description changes.
+if [ ! -f "$version_tracking_stamp" ]; then
+    (cd "$project_dir" && cargo clean -p esp-idf-sys \
+        --target xtensa-esp32s3-espidf --release)
+    touch "$version_tracking_stamp"
+fi
+
 printf 'CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="%s/firmware/partitions.csv"\n' \
     "$project_dir" > "$next_defaults"
 if ! cmp -s "$next_defaults" "$generated_defaults"; then
@@ -40,7 +62,16 @@ fi
 
 export ESP_IDF_SDKCONFIG_DEFAULTS="$project_dir/firmware/sdkconfig.defaults;$generated_defaults"
 export ESP_IDF_SYS_ROOT_CRATE="temporal-trivia-badge-firmware"
+export ESP_IDF_GLOB_BUILD_METADATA_BASE="$build_metadata_dir"
+export ESP_IDF_GLOB_BUILD_METADATA_VERSION="version.txt"
 export BADGE_BUILD_UNIX_EPOCH=$(date +%s)
 
 cd "$project_dir"
-exec cargo build -j 2 -p temporal-trivia-badge-firmware --release "$@"
+cargo build -j 2 -p temporal-trivia-badge-firmware --release "$@"
+
+firmware_elf="$project_dir/target/xtensa-esp32s3-espidf/release/temporal-trivia-badge-firmware"
+if ! strings "$firmware_elf" | grep -Fqx "$firmware_version"; then
+    echo "firmware metadata mismatch: expected embedded version $firmware_version" >&2
+    exit 1
+fi
+echo "verified embedded firmware version: $firmware_version"

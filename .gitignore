@@ -15,4 +15,5 @@ credentials.json
 firmware/sdkconfig
 firmware/sdkconfig.old
 /.sdkconfig.partition.defaults
+/.firmware-build-metadata/
 .DS_Store

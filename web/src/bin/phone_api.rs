@@ -37,6 +37,8 @@ const PHONE_HTML: &str = include_str!("../../static/phone.html");
 const SPACE_GROTESK_TTF: &[u8] = include_bytes!("../../static/space-grotesk.ttf");
 const SPACE_MONO_TTF: &[u8] = include_bytes!("../../static/space-mono.ttf");
 const ASTRONAUT_SVG: &[u8] = include_bytes!("../../static/astronaut.svg");
+const TEMPORAL_LOGO_HORIZONTAL_LIGHT_SVG: &[u8] =
+    include_bytes!("../../static/temporal-logo-horizontal-light.svg");
 
 #[workflow]
 #[derive(Default)]
@@ -177,6 +179,10 @@ async fn main() -> Result<()> {
         .route("/assets/space-grotesk.ttf", get(space_grotesk_asset))
         .route("/assets/space-mono.ttf", get(space_mono_asset))
         .route("/assets/astronaut.svg", get(astronaut_asset))
+        .route(
+            "/assets/temporal-logo-horizontal-light.svg",
+            get(temporal_logo_horizontal_light_asset),
+        )
         .route("/api/phone/state", get(phone_state))
         .route("/api/phone/heartbeat", post(phone_heartbeat))
         .route("/api/phone/answer", post(phone_answer))
@@ -217,6 +223,10 @@ async fn space_mono_asset() -> Response {
 
 async fn astronaut_asset() -> Response {
     asset("image/svg+xml", ASTRONAUT_SVG)
+}
+
+async fn temporal_logo_horizontal_light_asset() -> Response {
+    asset("image/svg+xml", TEMPORAL_LOGO_HORIZONTAL_LIGHT_SVG)
 }
 
 async fn phone_state(

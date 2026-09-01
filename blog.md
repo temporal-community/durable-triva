@@ -100,6 +100,19 @@
   game-rule material now lives behind direct links to `firmware/README.md`,
   `web/README.md`, and `GAME_SPEC.md` instead of being repeated at the root.
 
+## 2026-08-31 — Official Temporal logo added as a shared web asset
+
+- Added Temporal's official horizontal light SVG lockup from the supplied
+  Contentful asset URL. The downloaded source is path-only SVG with no scripts,
+  embedded images, or external links.
+- Embedded and exposed the logo from both Rust web binaries at
+  `/assets/temporal-logo-horizontal-light.svg`, keeping deployment behavior
+  consistent with the existing fonts and astronaut artwork.
+- Placed the lockup in the attract-screen header's upper-right corner opposite
+  the Durable Trivia wordmark. It replaces the otherwise-hidden idle meters,
+  then yields that grid position back to live question and handoff telemetry
+  when a round begins.
+
 ## 2026-08-17 — First playable Temporal trivia build
 
 - Created a standalone Git repository with two product folders: `firmware/`
@@ -800,3 +813,78 @@
   the lower divider rows. At 720p, the header-rule-to-first-callsign gap had
   been 30 px versus 20 px below; the board now removes that extra 10 px without
   bringing back the two short top borders.
+
+## 2026-09-01 — Tim Bruce's PR #1 integrated
+
+- Fetched `timjbruce/temporal-trivia-badge:updates` at `a570660` and merged its
+  22 commits into current `main` as merge commit `88510e6`. GitHub reported the
+  PR as dirty because it branched from `7f35c4f`, before the phone-player and
+  streamlined-documentation commits.
+- Resolved the shared-contract split, Workflow signal handling, controller
+  startup, and README conflicts while retaining phone-only rounds, dynamic
+  badge/phone Activity targets, and the 150-question History payload cap.
+- Preserved Tim's SDK envconfig migration, real recovery-query health flag,
+  guarded memo update, reduced Visibility upserts, shared identity derivation,
+  time-aware chaos validation, and host-testable badge-input state machine.
+- The combined host gate passed strict Clippy and 72 tests across `badge-input`,
+  `badge-screen`, `shared`, and `web`; `git diff --check` passed after removing
+  trailing spaces from the archived migration diff.
+- The ESP32-S3 release build passed in 2m20s after reusing the checkout's
+  ignored `ldproxy`, Wi-Fi, and Temporal environment files. No badge was
+  flashed, so physical button behavior remains unvalidated for this merge.
+
+## 2026-09-01 — Tim PR firmware test-flashed to KEEN-RAVEN-C8
+
+- Rediscovered two connected 16 MB ESP32-S3 revision 0.2 badges before writing:
+  `KEEN-RAVEN-C8` and `KEEN-SEAL-70`. Selected only `KEEN-RAVEN-C8`; the
+  second badge was not flashed.
+- Rebuilt the current merged checkout in 2m07s. The release ELF SHA-256 was
+  `367a6cf91cddedd2ccff86e912cde8cb260e2b371fcdf9a5ba1d626bbac8db80`,
+  and the ELF contains `<badge_input::ButtonState>::advance`, confirming Tim's
+  new host-tested input state machine is linked into the flashed image.
+- `espflash` identified the target again and wrote the factory application with
+  the explicit 16 MB partition table. The application occupied
+  8,395,504 / 14,680,064 bytes (57.19%).
+- A reset booted the factory partition, detected 8 MB PSRAM, passed the SRAM
+  memory test, identified itself as `KEEN-RAVEN-C8`, joined the configured
+  Wi-Fi network, initialized time sync, and logged
+  `Polling trivia queue temporal-trivia-badges-v1 as badge/KEEN-RAVEN-C8`.
+- The ESP-IDF application descriptor still prints cached version/build labels
+  `c04c90f-dirty` and `Aug 20 2026`, while its runtime ELF SHA prefix matches
+  the newly built `367a6cf91...`. This is a metadata freshness defect, not an
+  ambiguous flashed payload, but should be corrected before relying on the
+  serial version label operationally.
+- Serial verification proves flash, boot, PSRAM, Wi-Fi, identity, and Temporal
+  polling. OLED appearance, the LEFT/RIGHT crossover fix, crash gesture,
+  haptics, and sleep/wake still require physical button/display acceptance.
+- Published the sanitized hardware result to PR #1 without badge MAC or private
+  LAN details: https://github.com/temporal-community/durable-triva/pull/1#issuecomment-5495947556
+- Pushed merge commit `88510e6171a0274b8148b7a0b7ed4c5f7aedaa1e` over SSH as a
+  non-force fast-forward from `759a355` to `temporal-community/durable-triva`
+  `main`. GitHub confirmed PR #1 closed and merged at that exact commit on
+  2026-09-01T15:01:23Z.
+
+## 2026-09-01 — Firmware build metadata cache fixed
+
+- Traced the stale serial version/build labels to Cargo reusing ESP-IDF's C
+  application descriptor while relinking current Rust firmware. The old label
+  therefore survived even though the flashed ELF hash and Rust symbols were
+  current.
+- `build-firmware.sh` now writes the checkout's `git describe --always --dirty`
+  result to an ignored build-metadata input copied into the native ESP-IDF
+  project. `esp-idf-sys` tracks that input and rebuilds the descriptor whenever
+  the Git description changes.
+- Existing checkouts need one native-cache bootstrap because their old Cargo
+  metadata cannot know about a newly tracked file. The first attempt omitted
+  the explicit ESP32 target and removed only two host directories; the fixed
+  command removed 1,678 target files / 336 MiB and rebuilt `esp-idf-sys`.
+- The clean native rebuild initially failed in the restricted sandbox while
+  resolving `dl.espressif.com`, PyPI, and GitHub. Repeating the same build with
+  network access succeeded; no dependency versions or source files changed.
+- The rebuilt ELF embeds `88510e6-dirty` and `Sep 1 2026` instead of
+  `c04c90f-dirty` and `Aug 20 2026`. A post-build assertion now fails firmware
+  builds unless the ELF contains the exact expected Git description.
+- The final incremental release build passed in 2m01s and printed
+  `verified embedded firmware version: 88510e6-dirty`. Strict Clippy and all 72
+  host tests also passed. This corrected artifact was not reflashed; physical
+  button, OLED, haptic, and sleep/wake acceptance remains outstanding.
