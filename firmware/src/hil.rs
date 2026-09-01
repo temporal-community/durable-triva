@@ -124,11 +124,12 @@ fn handle_command(
         // runner can ask for. The boot log line it replaced is printed once,
         // so a port opened without resetting the badge never sees it.
         log::info!(
-            "HIL STATUS callsign={} polling={} active={} question={}",
+            "HIL STATUS callsign={} polling={} active={} question={} stack={}",
             callsign,
             worker_polling.load(Ordering::Acquire),
             activity_active.load(Ordering::Acquire),
-            question_id
+            question_id,
+            crate::ui::stack_headroom()
         );
         return;
     }

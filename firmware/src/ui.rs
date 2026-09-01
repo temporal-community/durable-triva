@@ -53,6 +53,20 @@ const MAX_QUEUED_CHOICES: usize = 8;
 const POWERUP_OVERLAY: Duration = Duration::from_millis(1_500);
 const SLEEP_ARM_DELAY: Duration = Duration::from_millis(250);
 const SLEEP_HOLD: Duration = Duration::from_secs(3);
+/// How often to report this thread's worst-case stack headroom.
+///
+/// Every panic so far has been a double exception, which on Xtensa means a
+/// fault inside the exception handler and almost always a stack that ran out.
+/// The backtrace is destroyed by definition in that case, so the honest way
+/// to find it is to watch the headroom rather than the wreckage.
+const STACK_REPORT_INTERVAL: Duration = Duration::from_secs(15);
+
+/// Bytes of stack this task has never used, at its worst moment so far.
+pub fn stack_headroom() -> u32 {
+    // SAFETY: a read of the current task's own FreeRTOS bookkeeping, with the
+    // null handle meaning "me", which is always valid from a running task.
+    unsafe { esp_idf_svc::sys::uxTaskGetStackHighWaterMark(std::ptr::null_mut()) }
+}
 
 /// A screen the Temporal side wants shown.
 ///
@@ -237,6 +251,7 @@ pub fn start(
                 injected: VecDeque::new(),
                 down_since: None,
                 countdown_shown: None,
+                last_stack_report: Instant::now(),
             };
             state.run(&inbox);
         })
@@ -258,6 +273,7 @@ struct UiThread {
     injected: VecDeque<Buttons>,
     down_since: Option<Instant>,
     countdown_shown: Option<u64>,
+    last_stack_report: Instant,
 }
 
 impl UiThread {
@@ -279,6 +295,10 @@ impl UiThread {
             let buttons = self.sample();
             self.advance_buttons(buttons, now);
             self.advance_sleep(buttons, now);
+            if self.last_stack_report.elapsed() >= STACK_REPORT_INTERVAL {
+                self.last_stack_report = now;
+                log::info!("ui thread stack headroom: {} bytes", stack_headroom());
+            }
             self.shared.ticks.fetch_add(1, Ordering::Release);
             thread::sleep(TICK);
         }

@@ -455,6 +455,7 @@ impl BadgeActivities {
                     free_heap(),
                     lowest_heap()
                 );
+                log::warn!("main task stack headroom: {} bytes", ui::stack_headroom());
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
