@@ -1020,3 +1020,8 @@
   attempt-1 question immediately, and both returned to waiting after results.
   The runner printed `PASS`, and the old-history nondeterminism warning did not
   recur against the new latest Workflow history.
+- Before publishing, wrapped the scheduler command change in Temporal patch ID
+  `full-participant-backlog-v1`. Histories created before the change now replay
+  their recorded one-reserve command sequence, while new runs record the patch
+  marker and schedule every participant. This addresses the upgrade warning at
+  its source instead of relying on a new round to replace the latest history.

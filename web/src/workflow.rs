@@ -64,6 +64,7 @@ enum ActivityKind {
 }
 
 pub type GameWorkflowRun = <GameWorkflow as temporalio_common::HasWorkflowDefinition>::Run;
+const FULL_PARTICIPANT_BACKLOG_PATCH: &str = "full-participant-backlog-v1";
 
 #[workflow_methods]
 impl GameWorkflow {
@@ -72,6 +73,7 @@ impl GameWorkflow {
         ctx: &mut WorkflowContext<Self>,
         input: GameInput,
     ) -> WorkflowResult<GameSnapshot> {
+        let full_participant_backlog = ctx.patched(FULL_PARTICIPANT_BACKLOG_PATCH);
         let started_unix_ms = unix_ms(ctx.workflow_time().unwrap_or(UNIX_EPOCH));
         let deadline_unix_ms = started_unix_ms + input.duration_seconds * 1_000;
         ctx.state_mut(|state| {
@@ -97,7 +99,13 @@ impl GameWorkflow {
             };
             state.snapshot.push_event("Round started".to_owned());
             if let Some(badge_count) = input.detected_badge_count {
-                let active_slots = input.backlog_override.unwrap_or(badge_count);
+                let active_slots = input.backlog_override.unwrap_or_else(|| {
+                    if full_participant_backlog {
+                        badge_count
+                    } else {
+                        badge_count.saturating_sub(1).max(1)
+                    }
+                });
                 if badge_count == 0 {
                     state
                         .snapshot
@@ -146,8 +154,13 @@ impl GameWorkflow {
                     .rust_only_until_unix_ms
                     .is_some_and(|until| until > now_unix_ms)
             });
-            let (badge_target, phone_target) =
-                ctx.state(|state| activity_targets(&state.snapshot, input.backlog_override));
+            let (badge_target, phone_target) = ctx.state(|state| {
+                activity_targets(
+                    &state.snapshot,
+                    input.backlog_override,
+                    full_participant_backlog,
+                )
+            });
             while pending_badges < badge_target || pending_phones < phone_target {
                 if available.is_empty() && !question_template.is_empty() {
                     deck_cycle = deck_cycle.saturating_add(1);
@@ -768,13 +781,29 @@ fn active_points(snapshot: &GameSnapshot, now_unix_ms: u64) -> i32 {
     }
 }
 
-fn activity_targets(snapshot: &GameSnapshot, override_value: Option<usize>) -> (usize, usize) {
+fn activity_targets(
+    snapshot: &GameSnapshot,
+    override_value: Option<usize>,
+    full_participant_backlog: bool,
+) -> (usize, usize) {
     let badges = snapshot.detected_badge_count as usize;
     let phones = snapshot.registered_phone_count as usize;
-    let badge_target = override_value.unwrap_or(badges);
+    let badge_target = override_value.unwrap_or_else(|| {
+        if full_participant_backlog {
+            badges
+        } else if badges == 0 {
+            0
+        } else {
+            badges.saturating_sub(1).max(1)
+        }
+    });
     let phone_target = if badges == 0 {
         // Bootstrap a phone-only round before the first browser can register.
-        phones.max(1)
+        if full_participant_backlog {
+            phones.max(1)
+        } else {
+            phones.saturating_sub(1).max(1)
+        }
     } else {
         phones
     };
@@ -958,11 +987,16 @@ mod tests {
             detected_badge_count: 2,
             ..Default::default()
         };
-        assert_eq!(activity_targets(&snapshot, None), (2, 0));
+        assert_eq!(activity_targets(&snapshot, None, true), (2, 0));
+        assert_eq!(
+            activity_targets(&snapshot, None, false),
+            (1, 0),
+            "pre-patch histories retain their recorded command sequence"
+        );
 
         snapshot.registered_phone_count = 3;
-        assert_eq!(activity_targets(&snapshot, None), (2, 3));
-        assert_eq!(activity_targets(&snapshot, Some(1)), (1, 3));
+        assert_eq!(activity_targets(&snapshot, None, true), (2, 3));
+        assert_eq!(activity_targets(&snapshot, Some(1), true), (1, 3));
     }
 
     #[test]
