@@ -31,10 +31,10 @@ use esp_idf_svc::{
 };
 use rustls::{RootCertStore, client::WebPkiServerVerifier};
 use temporalio_client::{
-    Client, ClientOptions, Connection, ConnectionOptions, TlsOptions, WorkflowQueryOptions,
-    WorkflowSignalOptions,
+    ActivityIdentifier, Client, ClientOptions, Connection, ConnectionOptions, RpcOptions,
+    TlsOptions, WorkflowQueryOptions, WorkflowSignalOptions,
 };
-use temporalio_common::worker::WorkerDeploymentOptions;
+use temporalio_common::{protos::TaskToken, worker::WorkerDeploymentOptions};
 use temporalio_macros::{activities, workflow, workflow_methods};
 use temporalio_sdk::{
     Runtime, SyncWorkflowContext, Worker, WorkerOptions, WorkflowContext, WorkflowContextView,
@@ -52,12 +52,15 @@ use crate::{
     haptics::{BadgeHaptics, HapticEvent, SharedHaptics},
     identity::{BadgeIdentity, factory_identity},
     input::BadgeInput,
-    model::{BADGE_TASK_QUEUE, BadgeAnswer, BadgeEvent, GameInput, GameSnapshot, QuestionTask},
+    model::{
+        BADGE_CRASH_BLACKOUT_MS, BADGE_HEARTBEAT_INTERVAL_MS, BADGE_TASK_QUEUE, BadgeAnswer,
+        BadgeEvent, GameInput, GameSnapshot, QuestionTask,
+    },
     session::SessionStore,
 };
 
 include!(concat!(env!("OUT_DIR"), "/firmware_config.rs"));
-const HEARTBEAT_BLACKOUT: Duration = Duration::from_secs(6);
+const HEARTBEAT_BLACKOUT: Duration = Duration::from_millis(BADGE_CRASH_BLACKOUT_MS);
 const WORKER_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 const MAX_ACTIVITY_RUNTIME: Duration = Duration::from_secs(120);
 const POWERUP_OVERLAY: Duration = Duration::from_millis(1_500);
@@ -187,13 +190,21 @@ impl BadgeActivities {
     ) -> Result<BadgeAnswer, ActivityError> {
         let _active = ActivityActiveGuard::new(Arc::clone(&self.activity_active));
         let _current = CurrentQuestionGuard::new(Arc::clone(&self.current_question), task.clone())?;
+        log::info!(
+            "Question {} attempt {} heartbeat timeout {:?}",
+            task.question.id,
+            ctx.info().attempt,
+            ctx.info().heartbeat_timeout
+        );
         // The Activity payload already contains everything needed to draw the
         // question. Do that before NVS or Cloud telemetry so a slow Signal can
         // never make a newly assigned badge look frozen.
         show_question(&self.display, &self.identity.callsign, &task)?;
+        Self::record_activity_heartbeat(&ctx).await?;
         self.session
             .begin_game(&task.game_id, task.deadline_unix_ms)?;
         self.start_result_watcher(&ctx, &task)?;
+        Self::record_activity_heartbeat(&ctx).await?;
 
         let event = BadgeEvent {
             badge_id: self.identity.id.clone(),
@@ -202,21 +213,31 @@ impl BadgeActivities {
             attempt: ctx.info().attempt,
         };
         if let Some(handle) = ctx.workflow_handle::<GameWorkflow>() {
-            match tokio::time::timeout(
-                GAME_SIGNAL_TIMEOUT,
-                handle.signal(
-                    GameWorkflow::badge_started,
-                    event.clone(),
-                    WorkflowSignalOptions::default(),
-                ),
-            )
-            .await
-            {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => log::warn!("could not signal badge start: {error}"),
-                Err(_) => log::warn!("badge start Signal exceeded 750 ms; continuing Activity"),
-            }
+            // This Signal is observational telemetry, not part of accepting an
+            // answer. Keep it off the Activity's heartbeat-critical path: on
+            // the ESP32 runtime an unhealthy Signal has outlived its local
+            // timeout and allowed the server heartbeat timeout to expire.
+            let start_event = event.clone();
+            tokio::spawn(async move {
+                match tokio::time::timeout(
+                    GAME_SIGNAL_TIMEOUT,
+                    handle.signal(
+                        GameWorkflow::badge_started,
+                        start_event,
+                        WorkflowSignalOptions::default(),
+                    ),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => log::warn!("could not signal badge start: {error}"),
+                    Err(_) => {
+                        log::warn!("badge start Signal exceeded 750 ms; continuing Activity")
+                    }
+                }
+            });
         }
+        Self::record_activity_heartbeat(&ctx).await?;
 
         // Report every real Temporal attempt before this Worker refuses a
         // question it already abandoned. That keeps the public attempt count
@@ -228,6 +249,7 @@ impl BadgeActivities {
             tokio::time::sleep(Duration::from_millis(250)).await;
             return Err(anyhow!("badge already abandoned this question").into());
         }
+        log::info!("Question {} preparation complete", task.question.id);
 
         let activity_deadline_unix_ms = task.latest_possible_deadline_unix_ms();
         match self
@@ -328,29 +350,46 @@ impl BadgeActivities {
         // This monotonic ceiling prevents a stale build-time clock fallback from
         // leaving the physical badge stuck in an Activity indefinitely.
         let local_deadline = Instant::now() + MAX_ACTIVITY_RUNTIME;
-        while self.sample_buttons()?.any() {
-            if ctx.is_cancelled()
-                || unix_ms() >= deadline_unix_ms
-                || Instant::now() >= local_deadline
-            {
-                return Err(ActivityError::cancelled());
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-
-        let mut state = ButtonState::default();
-        let mut last_heartbeat = Instant::now();
+        let mut state = if self.sample_buttons()?.any() {
+            // A press already in progress belongs to the previous screen. Keep
+            // suppressing it until release, but remain inside the heartbeat
+            // loop so a held or electrically stuck button cannot make a
+            // healthy Worker look dead to Temporal.
+            ButtonState::SuppressedUntilRelease
+        } else {
+            ButtonState::default()
+        };
+        let heartbeat_interval = Duration::from_millis(BADGE_HEARTBEAT_INTERVAL_MS);
+        let mut last_heartbeat = Instant::now()
+            .checked_sub(heartbeat_interval)
+            .unwrap_or_else(Instant::now);
         loop {
-            if ctx.is_cancelled()
-                || unix_ms() >= deadline_unix_ms
-                || Instant::now() >= local_deadline
-            {
+            if ctx.is_cancelled() {
+                log::warn!(
+                    "Activity attempt {} was cancelled by Temporal",
+                    ctx.info().attempt
+                );
                 return Err(ActivityError::cancelled());
             }
-            if last_heartbeat.elapsed() >= Duration::from_secs(1) {
-                if let Err(error) = ctx.record_heartbeat(()).await {
-                    log::warn!("could not encode Activity heartbeat: {error}");
-                }
+            let now_unix_ms = unix_ms();
+            if now_unix_ms >= deadline_unix_ms {
+                log::warn!(
+                    "Activity attempt {} reached game deadline: now={} deadline={}",
+                    ctx.info().attempt,
+                    now_unix_ms,
+                    deadline_unix_ms
+                );
+                return Err(ActivityError::cancelled());
+            }
+            if Instant::now() >= local_deadline {
+                log::warn!(
+                    "Activity attempt {} reached local runtime ceiling",
+                    ctx.info().attempt
+                );
+                return Err(ActivityError::cancelled());
+            }
+            if last_heartbeat.elapsed() >= heartbeat_interval {
+                Self::record_activity_heartbeat(ctx).await?;
                 last_heartbeat = Instant::now();
             }
             let (next, choice) = state.advance(
@@ -373,6 +412,42 @@ impl BadgeActivities {
             .lock()
             .map_err(|_| anyhow!("input lock poisoned"))?
             .sample())
+    }
+
+    async fn record_activity_heartbeat(ctx: &ActivityContext) -> Result<(), ActivityError> {
+        // Keep Core's local Activity heartbeat state current. On ESP32, the
+        // queued Worker path alone has not reliably reached Temporal before
+        // the server timeout, even with a one-second throttle.
+        ctx.record_heartbeat(())
+            .await
+            .map_err(|error| anyhow!("could not encode Activity heartbeat: {error}"))?;
+
+        // Await a direct server acknowledgement as well. This prevents a lost
+        // Core-to-server heartbeat path from looking healthy until Temporal
+        // reassigns the question to another badge.
+        let handle = ctx
+            .client()
+            .get_async_activity_handle(ActivityIdentifier::from_task_token(TaskToken(
+                ctx.info().task_token.clone(),
+            )));
+        let response = match handle.heartbeat(Some(()), RpcOptions::default()).await {
+            Ok(response) => response,
+            Err(error) => {
+                log::error!("Activity heartbeat RPC failed: {error}");
+                return Err(anyhow!("Activity heartbeat RPC failed: {error}").into());
+            }
+        };
+        if response.cancel_requested || response.activity_paused || response.activity_reset {
+            log::warn!(
+                "Activity heartbeat response stopped attempt {}: cancel={} paused={} reset={}",
+                ctx.info().attempt,
+                response.cancel_requested,
+                response.activity_paused,
+                response.activity_reset
+            );
+            return Err(ActivityError::cancelled());
+        }
+        Ok(())
     }
 
     fn start_result_watcher(
@@ -540,6 +615,7 @@ async fn run_worker(
     let worker_identity = format!("badge/{}", identity.callsign);
     let worker_options = WorkerOptions::new(BADGE_TASK_QUEUE)
         .client_identity_override(worker_identity.clone())
+        .max_heartbeat_throttle_interval(Duration::from_millis(BADGE_HEARTBEAT_INTERVAL_MS))
         .tuner(Arc::new(tuner.build()))
         .deployment_options(WorkerDeploymentOptions::from_build_id(
             "temporal-trivia-badge-0.1.0".to_owned(),

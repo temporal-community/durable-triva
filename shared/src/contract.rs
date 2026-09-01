@@ -19,6 +19,17 @@ pub const WEB_TASK_QUEUE: &str = BADGE_TASK_QUEUE;
 pub const GAME_SECONDS: u64 = 60;
 pub const CHAOS_DURATION_MS: u64 = 10_000;
 pub const GAME_EXTENSION_MS: u64 = 30_000;
+/// How frequently a badge confirms its live Activity directly with Temporal.
+pub const BADGE_HEARTBEAT_INTERVAL_MS: u64 = 1_000;
+/// Temporal retries a badge Activity after this long without a heartbeat.
+/// Embedded Wi-Fi and Cloud RPCs can occasionally stall beyond five seconds.
+pub const BADGE_HEARTBEAT_TIMEOUT_MS: u64 = 15_000;
+/// A deliberate badge failure must remain silent past the Temporal timeout.
+pub const BADGE_CRASH_BLACKOUT_MS: u64 = 16_000;
+const _: () = {
+    assert!(BADGE_HEARTBEAT_INTERVAL_MS < BADGE_HEARTBEAT_TIMEOUT_MS);
+    assert!(BADGE_HEARTBEAT_TIMEOUT_MS < BADGE_CRASH_BLACKOUT_MS);
+};
 /// Rolling event window carried on every snapshot.
 pub const EVENT_WINDOW: usize = 24;
 

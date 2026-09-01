@@ -888,3 +888,44 @@
   `verified embedded firmware version: 88510e6-dirty`. Strict Clippy and all 72
   host tests also passed. This corrected artifact was not reflashed; physical
   button, OLED, haptic, and sleep/wake acceptance remains outstanding.
+
+## 2026-09-01 — Badge Activity heartbeat gaps fixed and flashed
+
+- Fetched `temporal-community/durable-triva` over SSH before editing and
+  confirmed local `20bdd7e` exactly matched authoritative `main`. The
+  configured personal-fork `origin` was one commit behind, but was not used as
+  the upstream baseline.
+- A one-question hardware round repeatedly reassigned a healthy
+  `KEEN-RAVEN-C8`. The controller labels any retry without a crash Signal as
+  `heartbeat timeout`, so serial diagnostics and Temporal Cloud history were
+  used instead of trusting that fallback text. Cloud ultimately confirmed
+  `TIMEOUT_TYPE_HEARTBEAT` with a five-second Activity heartbeat timeout.
+- Early hypotheses were incomplete: changing the Worker heartbeat interval,
+  setting the Activity heartbeat throttle, and moving held-button suppression
+  inside the input loop did not cover setup work before that loop. NVS session
+  setup and an awaited `badge_started` Signal could run before the first stable
+  input heartbeat; one Signal exceeded its nominal 750 ms local timeout.
+- Firmware now heartbeats immediately around setup, continues heartbeating
+  while held buttons are suppressed, and sends the observational
+  `badge_started` Signal outside the answer-critical path. It records through
+  Core for local watchdog state and also awaits a direct server heartbeat,
+  because the queued Worker path alone did not reliably reach Temporal on the
+  ESP32 runtime during hardware trials.
+- The shared contract now keeps a one-second heartbeat interval, a 15-second
+  server timeout, and a 16-second deliberate-crash blackout, with compile-time
+  ordering assertions. Five seconds proved too aggressive for transient
+  embedded Wi-Fi and Cloud RPC stalls. The Workflow and firmware consume the
+  same constants.
+- An incremental `espflash` write twice left a changed trailing application
+  segment erased and produced `invalid segment length 0xffffffff`. A full
+  `--no-skip` write recovered the factory partition; subsequent validation
+  flashes used the same full-write mode and booted all six app segments.
+- Final dirty-build acceptance on `KEEN-RAVEN-C8` reported Activity heartbeat
+  timeout `Some(15s)`, held attempt 1 for the complete 60-second round, and
+  finished with zero reassignments and zero heartbeat timeouts. The second
+  connected badge was not flashed.
+- Strict Clippy, all 72 host tests, `git diff --check`, the ESP32-S3 release
+  build, bootloader segment validation, 8 MB PSRAM test, Wi-Fi connection, and
+  Temporal queue polling passed. No answer was recorded during the hands-on
+  prompt, so button choice, crash gesture, haptics, and sleep/wake remain
+  physically unconfirmed.

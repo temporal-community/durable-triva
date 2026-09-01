@@ -13,11 +13,11 @@ use temporalio_sdk::{
 };
 
 use crate::model::{
-    AnswerSpotlight, BADGE_TASK_QUEUE, BadgeAnswer, BadgeEvent, BadgeFailure, CHAOS_DURATION_MS,
-    ChaosCommand, EventKind, GAME_EXTENSION_MS, GameInput, GameSnapshot, GameStatus,
-    PHONE_TASK_QUEUE, PhoneActivityReady, PhoneAssignment, PhoneJoin, PhoneRosterSnapshot,
-    PhoneSessionSnapshot, PlayerKind, PlayerScore, PowerupNotice, Question, QuestionTask,
-    Reassignment, RoundMemo,
+    AnswerSpotlight, BADGE_HEARTBEAT_TIMEOUT_MS, BADGE_TASK_QUEUE, BadgeAnswer, BadgeEvent,
+    BadgeFailure, CHAOS_DURATION_MS, ChaosCommand, EventKind, GAME_EXTENSION_MS, GameInput,
+    GameSnapshot, GameStatus, PHONE_TASK_QUEUE, PhoneActivityReady, PhoneAssignment, PhoneJoin,
+    PhoneRosterSnapshot, PhoneSessionSnapshot, PlayerKind, PlayerScore, PowerupNotice, Question,
+    QuestionTask, Reassignment, RoundMemo,
 };
 
 pub struct BadgeActivities;
@@ -194,7 +194,9 @@ impl GameWorkflow {
                                 BadgeActivities::answer_question,
                                 task,
                                 ActivityOptions::with_schedule_to_close_timeout(activity_timeout)
-                                    .heartbeat_timeout(Duration::from_secs(5))
+                                    .heartbeat_timeout(Duration::from_millis(
+                                        BADGE_HEARTBEAT_TIMEOUT_MS,
+                                    ))
                                     .retry_policy(RetryPolicy {
                                         initial_interval: Some(prost_wkt_types::Duration {
                                             seconds: 0,

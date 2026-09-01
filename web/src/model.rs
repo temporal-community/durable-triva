@@ -1,10 +1,10 @@
 pub use temporal_trivia_shared::identity::is_badge_worker_identity;
 pub use temporal_trivia_shared::{
-    AnswerSpotlight, BADGE_TASK_QUEUE, BadgeAnswer, BadgeEvent, BadgeFailure, CHAOS_DURATION_MS,
-    ChaosCommand, EventKind, GAME_EXTENSION_MS, GAME_SECONDS, GameInput, GameSnapshot, GameStatus,
-    PHONE_TASK_QUEUE, PhoneActivityReady, PhoneAssignment, PhoneJoin, PhoneRosterSnapshot,
-    PhoneSessionSnapshot, PlayerKind, PlayerScore, PowerupNotice, Question, QuestionTask,
-    Reassignment, WEB_TASK_QUEUE,
+    AnswerSpotlight, BADGE_HEARTBEAT_TIMEOUT_MS, BADGE_TASK_QUEUE, BadgeAnswer, BadgeEvent,
+    BadgeFailure, CHAOS_DURATION_MS, ChaosCommand, EventKind, GAME_EXTENSION_MS, GAME_SECONDS,
+    GameInput, GameSnapshot, GameStatus, PHONE_TASK_QUEUE, PhoneActivityReady, PhoneAssignment,
+    PhoneJoin, PhoneRosterSnapshot, PhoneSessionSnapshot, PlayerKind, PlayerScore, PowerupNotice,
+    Question, QuestionTask, Reassignment, WEB_TASK_QUEUE,
 };
 
 use serde::{Deserialize, Serialize};
