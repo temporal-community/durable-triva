@@ -929,3 +929,14 @@
   Temporal queue polling passed. No answer was recorded during the hands-on
   prompt, so button choice, crash gesture, haptics, and sleep/wake remain
   physically unconfirmed.
+
+## 2026-09-01 — Clean-commit button acceptance
+
+- Rebuilt the committed heartbeat fix as clean firmware version `100db4c`,
+  performed a full `--no-skip` flash to `KEEN-RAVEN-C8`, and again verified all
+  six application segments, PSRAM, Wi-Fi, and Temporal queue polling.
+- A subsequent hands-on press on Raven was recorded by the Workflow and
+  completed its Activity, proving the flashed button-to-Temporal answer path.
+  The answer was scored wrong (`-1`), matching the operator's confirmation that
+  they intentionally pressed a wrong answer. Crash gesture, haptics, and
+  sleep/wake remain physically unconfirmed.
