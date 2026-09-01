@@ -151,13 +151,16 @@ connection. With the controller running and exactly two badges connected, run:
 uv run --script tools/test_physical_badges.py
 ```
 
-The runner identifies both physical callsigns, starts a two-question Workflow,
-waits until both real badge Workers own a question, asks each badge firmware to
-inject the question's correct directional gesture, and verifies that Temporal
-records one correct answer per badge. It also verifies that both badges leave
-the final result screen and return to waiting for the next round. Opening the
-serial ports may reset the badges, so the identification step allows time for a
-complete boot and reconnect.
+The runner identifies both physical callsigns, starts a Workflow using the
+normal scheduler policy, and requires both real badge Workers to own questions
+simultaneously before answering either one. The round does not start until both
+Workers have logged that they are polling Temporal. The runner then asks each
+badge firmware to inject the question's correct directional gesture and
+verifies that Temporal records one correct answer per badge. It also verifies
+that both badges leave the final result screen and return to waiting for the
+next round. Opening the serial ports may reset the badges, so the identification
+step allows time for a complete boot and reconnect. `--backlog-override N`
+remains available for a deliberately nonstandard diagnostic run.
 
 This exercises the physical ESP32-S3 boards, firmware, Wi-Fi, Temporal Workers,
 and the same input state machine used by the face buttons. It does not optically

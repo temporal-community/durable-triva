@@ -995,3 +995,28 @@
 - Updated the game contract, controller guide, event text, shared backlog test,
   and Workflow target test. The running controller still needs to be rebuilt
   and restarted before live acceptance of this scheduler change.
+- Tightened the physical HIL runner so normal acceptance supplies no backlog
+  override and requires both badge Workers to hold questions simultaneously
+  before either answer is injected. The earlier sequential answer loop could
+  have passed even with a one-slot scheduler by freeing work for the other
+  badge. An explicit override remains available only as a diagnostic option.
+- The first no-override hardware run passed simultaneous ownership, correct
+  scoring, immediate follow-up assignment, and return to waiting on both
+  badges. Raven's first question arrived on Activity attempt 2 because the HIL
+  thread answered `STATUS` before its Temporal Worker had begun polling. The
+  runner now waits for polling logs from both physical Workers before starting
+  the round, matching the operator instruction to start only after badges are
+  ready.
+- During that reconnect, both badges briefly logged a nondeterminism error while
+  their power-up monitor queried the previous completed round, whose history
+  was written with the old one-slot scheduler. The new round itself used the
+  new code and completed normally. This is a rollout-compatibility warning for
+  the immediately preceding history, not a failure of the new round; a second
+  run against the new latest history is required to confirm the warning clears.
+- The readiness-corrected second run, Workflow
+  `trivia-8ddab9f5ad964c9694f5be46c2e16c39`, started only after both boards logged
+  Temporal polling. Raven and Seal then received attempt-1 questions
+  simultaneously, each scored one correct answer, each received another
+  attempt-1 question immediately, and both returned to waiting after results.
+  The runner printed `PASS`, and the old-history nondeterminism warning did not
+  recur against the new latest Workflow history.

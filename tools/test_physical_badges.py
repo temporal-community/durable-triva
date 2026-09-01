@@ -209,7 +209,12 @@ def wait_for_finished(controller: str, timeout: float) -> dict[str, JsonValue]:
     raise TimeoutError("physical badge round did not finish")
 
 
-def run_test(ports: list[str], controller: str, timeout: float) -> None:
+def run_test(
+    ports: list[str],
+    controller: str,
+    timeout: float,
+    backlog_override: int | None,
+) -> None:
     """Run one correct-answer round through both real badge Workers."""
     badges = [BadgePort(path) for path in ports]
     try:
@@ -220,12 +225,16 @@ def run_test(ports: list[str], controller: str, timeout: float) -> None:
             raise RuntimeError(f"badge callsigns are not unique: {callsigns}")
         print(f"HIL identified physical badges: {', '.join(callsigns)}")
 
+        for badge in badges:
+            badge.wait_for(r"Polling trivia queue", timeout)
+        print("HIL both physical Workers are polling Temporal")
+
         markers = {badge.path: badge.mark() for badge in badges}
+        start_payload: dict[str, JsonValue] = {}
+        if backlog_override is not None:
+            start_payload["backlog_override"] = backlog_override
         started = request_json(
-            controller,
-            "/api/start",
-            method="POST",
-            payload={"backlog_override": len(badges)},
+            controller, "/api/start", method="POST", payload=start_payload
         )
         print(f"HIL started round: {started.get('game_id')}")
 
@@ -235,6 +244,9 @@ def run_test(ports: list[str], controller: str, timeout: float) -> None:
                 timeout,
                 after=markers[badge.path],
             )
+        print("HIL both physical badges hold questions simultaneously")
+
+        for badge in badges:
             marker = badge.mark()
             badge.send("HIL ANSWER CORRECT")
             badge.wait_for(r"HIL ACK answer=", 5.0, after=marker)
@@ -268,11 +280,17 @@ def main() -> None:
     parser.add_argument("--port", action="append", default=[], dest="ports")
     parser.add_argument("--controller", default="http://127.0.0.1:3000")
     parser.add_argument("--timeout", type=float, default=120.0)
+    parser.add_argument(
+        "--backlog-override",
+        type=int,
+        help="diagnostic question backlog; omitted by default to test normal policy",
+    )
     arguments = parser.parse_args()
     run_test(
         discover_ports(cast(list[str], arguments.ports)),
         cast(str, arguments.controller),
         cast(float, arguments.timeout),
+        cast(int | None, arguments.backlog_override),
     )
 
 
