@@ -1,5 +1,6 @@
 mod display;
 mod haptics;
+mod hil;
 mod identity;
 mod input;
 mod model;
@@ -73,6 +74,9 @@ const ACTIVE_WORKFLOW_ID: &str = "temporal-trivia-active";
 /// final standings before it gives up and shows RESULT PENDING.
 const RESULT_WATCH_INTERVAL: Duration = Duration::from_secs(1);
 const RESULT_WATCH_POLLS: u32 = 45;
+/// Keep final standings readable, then make an idle recovery reserve visibly
+/// ready for the next round instead of leaving stale results on screen.
+const RESULT_HOLD: Duration = Duration::from_secs(5);
 
 type SharedDisplay = Arc<Mutex<BadgeDisplay>>;
 type SharedInput = Arc<Mutex<BadgeInput>>;
@@ -257,6 +261,11 @@ impl BadgeActivities {
             .await?
         {
             Choice::Answer(selected_index) => {
+                log::info!(
+                    "Input selected answer={} question={}",
+                    selected_index,
+                    task.question.id
+                );
                 let correct = selected_index == task.question.correct_index;
                 let points = self.point_value.load(Ordering::Acquire);
                 show_feedback(
@@ -501,6 +510,14 @@ impl BadgeActivities {
                             },
                         )
                         .await;
+                        tokio::time::sleep(RESULT_HOLD).await;
+                        match show_waiting(&display, &identity.callsign) {
+                            Ok(()) => log::info!(
+                                "Result hold complete; {} returned to waiting",
+                                identity.callsign
+                            ),
+                            Err(error) => log::error!("restore waiting screen: {error:#}"),
+                        }
                         return;
                     }
                     Ok(_) => {}
@@ -637,6 +654,12 @@ async fn run_worker(
     let mut worker = Worker::new(&sdk_runtime, client, worker_options)
         .map_err(|error| anyhow!(error.to_string()))?;
     show_waiting(&display, &identity.callsign)?;
+    hil::start(
+        Arc::clone(&input),
+        Arc::clone(&activity_active),
+        Arc::clone(&current_question),
+        identity.callsign.clone(),
+    )?;
     let sleep_display = Arc::clone(&display);
     let sleep_input = Arc::clone(&input);
     let sleep_haptics = Arc::clone(&haptics);

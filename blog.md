@@ -940,3 +940,41 @@
   The answer was scored wrong (`-1`), matching the operator's confirmation that
   they intentionally pressed a wrong answer. Crash gesture, haptics, and
   sleep/wake remain physically unconfirmed.
+
+## 2026-09-01 — Two-badge USB hardware-in-the-loop acceptance
+
+- A live round exposed a recovery-reserve UI defect: Raven retained the prior
+  win screen until Seal answered in the next round. The result watcher exited
+  after rendering final standings, so a badge that did not immediately receive
+  another Activity had no path back to an idle screen.
+- Firmware now holds final standings for five seconds and restores the waiting
+  screen. A newly assigned Activity aborts the prior result watcher, preventing
+  that delayed restore from overwriting a newer question.
+- Added a USB-local HIL protocol to the physical firmware. `HIL STATUS` reports
+  the stable callsign and current Activity state; `HIL ANSWER CORRECT` reads the
+  correct index from the question actually received by that badge Worker and
+  injects the corresponding press/release gesture into the same `ButtonState`
+  path used by the GPIO buttons. Explicit indexes `0` through `3` are also
+  available for directional mapping tests. Answer injection is rejected unless
+  the badge currently owns a question.
+- Added `tools/test_physical_badges.py`, a typed PEP 723 `uv` script that owns
+  both USB serial connections, identifies exactly two physical badges, starts a
+  two-question Workflow, waits for both Workers, requests correct answers, and
+  requires firmware acknowledgements, input logs, Temporal scoring, Workflow
+  completion, and return-to-waiting logs from both boards.
+- Full `--no-skip` flashes of the dirty HIL build succeeded on
+  `KEEN-RAVEN-C8` and `KEEN-SEAL-70`. Both ESP32-S3 boards booted all six
+  application segments, passed the 8 MB PSRAM check, connected to Wi-Fi, and
+  polled the Temporal badge queue.
+- The first HIL run was manually interrupted after both correct answers and
+  Seal's waiting restore while Raven was still in its result hold. A complete
+  second run, Workflow `trivia-0b14b34fb44b46e18f698c75205e2aa1`, recorded
+  one correct answer from each physical callsign and ended with both badges
+  logging their return to waiting. The runner printed
+  `PASS: both physical badges answered correctly and returned to waiting`.
+- Strict Clippy, all 73 host tests, Ruff lint and format checks, and the ESP32-S3
+  release build passed. This proves the real boards' boot, PSRAM, Wi-Fi,
+  question ownership, firmware input state machine, Activity completion,
+  scoring, and post-result readiness. It does not optically inspect OLED pixels
+  or physically confirm haptic strength, face-button mechanics, sleep/wake, or
+  the deliberate crash gesture.

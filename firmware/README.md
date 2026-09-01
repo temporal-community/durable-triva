@@ -111,8 +111,8 @@ running. Set `ESPFLASH` to an executable path to override the flashing tool.
 
 - Press the directional button matching the on-screen answer position.
 - Hold **LEFT+RIGHT** for 500 ms to simulate a Worker failure. The badge stops
-  heartbeating for six seconds; Temporal's five-second heartbeat timeout makes
-  the unfinished question available to another Worker.
+  heartbeating for 16 seconds; Temporal's 15-second heartbeat timeout makes the
+  unfinished question available to another Worker.
 - A wrong answer applies the score penalty and completes the Activity normally.
   Only a simulated Worker failure returns the question to the Task Queue.
 - A web power-up causes each awake badge to vibrate and show a 1.5-second
@@ -141,6 +141,28 @@ button input, simulated crash, and sleep/wake behavior.
 
 Confirm the haptic strength and patterns by hand on the physical badge; serial
 logs can verify the event path but cannot verify how the motor feels.
+
+### Automated two-badge acceptance
+
+The flashed firmware accepts a small HIL command protocol over its USB serial
+connection. With the controller running and exactly two badges connected, run:
+
+```sh
+uv run --script tools/test_physical_badges.py
+```
+
+The runner identifies both physical callsigns, starts a two-question Workflow,
+waits until both real badge Workers own a question, asks each badge firmware to
+inject the question's correct directional gesture, and verifies that Temporal
+records one correct answer per badge. It also verifies that both badges leave
+the final result screen and return to waiting for the next round. Opening the
+serial ports may reset the badges, so the identification step allows time for a
+complete boot and reconnect.
+
+This exercises the physical ESP32-S3 boards, firmware, Wi-Fi, Temporal Workers,
+and the same input state machine used by the face buttons. It does not optically
+inspect OLED pixels or confirm the physical feel of haptics and buttons. Those,
+sleep/wake, and the deliberate crash gesture still require hands-on acceptance.
 
 ## Screens
 

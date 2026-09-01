@@ -31,6 +31,38 @@ impl Buttons {
     }
 }
 
+/// Returns the two samples that make a USB HIL answer indistinguishable from
+/// a complete physical button gesture to [`ButtonState`].
+#[must_use]
+pub const fn answer_gesture(index: u8) -> Option<[Buttons; 2]> {
+    let released = Buttons {
+        up: false,
+        right: false,
+        down: false,
+        left: false,
+    };
+    let pressed = match index {
+        0 => Buttons {
+            up: true,
+            ..released
+        },
+        1 => Buttons {
+            right: true,
+            ..released
+        },
+        2 => Buttons {
+            left: true,
+            ..released
+        },
+        3 => Buttons {
+            down: true,
+            ..released
+        },
+        _ => return None,
+    };
+    Some([pressed, released])
+}
+
 /// What the badge decided a gesture meant.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Choice {
@@ -189,6 +221,17 @@ mod tests {
     fn up_and_down_answer_on_press() {
         assert_eq!(run(&[(UP, false)]).1, [Choice::Answer(0)]);
         assert_eq!(run(&[(DOWN, false)]).1, [Choice::Answer(3)]);
+    }
+
+    #[test]
+    fn every_hil_gesture_uses_the_real_button_mapping() {
+        for expected_index in 0..=3 {
+            let samples = answer_gesture(expected_index)
+                .expect("all four answer indexes have a gesture")
+                .map(|buttons| (buttons, false));
+            assert_eq!(run(&samples).1, [Choice::Answer(expected_index)]);
+        }
+        assert_eq!(answer_gesture(4), None);
     }
 
     #[test]
