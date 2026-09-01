@@ -18,6 +18,16 @@ CONFIG_FREERTOS_HZ=1000
 # canary fires on whichever task overflows, and ESP-IDF's own wifi and tcpip
 # tasks were the ones nobody had measured.
 CONFIG_FREERTOS_USE_TRACE_FACILITY=y
+# Threads this firmware does not create still have to survive TLS.
+#
+# A full task sweep found four pthreads per badge: the two this firmware
+# creates, sized explicitly, and two more from inside the SDK, tokio's
+# blocking pool or esp-idf-svc, running on the 3072-byte default. One of those
+# was down to 868 bytes of headroom. That is the profile of the intermittent
+# fault this project has been chasing: the canary fires, and the panic handler
+# then faults on a stack that is already gone, which is why every dump is a
+# double exception with no message and no backtrace.
+CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT=8192
 # A stack overflow was double-faulting, which loses the backtrace and the task
 # name and leaves only `_DoubleExceptionVector`. The end-of-stack watchpoint
 # traps the overflow at the boundary instead, so the panic names the task that
