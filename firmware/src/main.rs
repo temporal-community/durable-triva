@@ -46,14 +46,14 @@ use temporalio_sdk::{
 };
 use temporalio_sdk_core::{ActivitySlotKind, FixedSizeSlotSupplier, TunerBuilder, Url};
 
-use badge_input::{ButtonState, Choice, PANIC_HOLD};
+use badge_input::Choice;
 use badge_screen::Status;
 
 use crate::{
     display::BadgeDisplay,
     haptics::{BadgeHaptics, HapticEvent, SharedHaptics},
     identity::{BadgeIdentity, factory_identity},
-    input::BadgeInput,
+    input::ButtonReader,
     model::{
         BADGE_CRASH_BLACKOUT_MS, BADGE_HEARTBEAT_INTERVAL_MS, BADGE_TASK_QUEUE, BadgeAnswer,
         BadgeEvent, GameInput, GameSnapshot, QuestionTask, heartbeat_budget_exhausted,
@@ -107,7 +107,6 @@ const ABANDONED_REFUSAL_BACKOFF: Duration = Duration::from_millis(250);
 const INPUT_DIAGNOSTIC_INTERVAL: Duration = Duration::from_millis(2_000);
 
 type SharedDisplay = Arc<Mutex<BadgeDisplay>>;
-type SharedInput = Arc<Mutex<BadgeInput>>;
 type SharedQuestion = Arc<Mutex<Option<QuestionTask>>>;
 
 #[workflow]
@@ -144,12 +143,11 @@ type GameWorkflowRun = <GameWorkflow as temporalio_common::HasWorkflowDefinition
 struct BadgeActivities {
     display: SharedDisplay,
     haptics: SharedHaptics,
-    input: SharedInput,
+    input: ButtonReader,
     identity: BadgeIdentity,
     session: Arc<SessionStore>,
     result_watcher: Mutex<Option<ResultWatcher>>,
     activity_active: Arc<AtomicBool>,
-    powerup_active: Arc<AtomicBool>,
     current_question: SharedQuestion,
     /// Points a correct answer is currently worth, refreshed by the power-up
     /// poller. The badge shows feedback before the Workflow scores the answer,
@@ -321,7 +319,12 @@ impl BadgeActivities {
         self.session
             .begin_game(&task.game_id, task.deadline_unix_ms)?;
         self.signal_badge_started(&ctx, event.clone());
-        log::info!("Question {} preparation complete", task.question.id);
+        log::info!(
+            "Question {} preparation complete (heap={} low={})",
+            task.question.id,
+            free_heap(),
+            lowest_heap()
+        );
 
         let activity_deadline_unix_ms = task.latest_possible_deadline_unix_ms();
         match self
@@ -432,27 +435,12 @@ impl BadgeActivities {
         // This monotonic ceiling prevents a stale build-time clock fallback from
         // leaving the physical badge stuck in an Activity indefinitely.
         let local_deadline = Instant::now() + MAX_ACTIVITY_RUNTIME;
-        let opening_buttons = self.sample_buttons()?;
-        let mut state = if opening_buttons.any() {
-            // A press already in progress belongs to the previous screen. Keep
-            // suppressing it until release, but remain inside the heartbeat
-            // loop so a held or electrically stuck button cannot make a
-            // healthy Worker look dead to Temporal.
-            log::warn!(
-                "Buttons already down as attempt {} opened ({opening_buttons:?}); input is suppressed until every button is released",
-                ctx.info().attempt
-            );
-            ButtonState::SuppressedUntilRelease
-        } else {
-            ButtonState::default()
-        };
+        // Anything the sampler recognised before this question opened was
+        // aimed at the previous screen.
+        self.input.discard_pending();
         let opened_at = Instant::now();
         let mut last_diagnostic = Instant::now();
-        // The loop is supposed to run at 50 Hz. Counting its turns is the only
-        // way to tell "the badge never saw your press" apart from "the badge
-        // was never scheduled to look" -- and those have opposite fixes.
-        let mut ticks = 0_u32;
-        let mut presses_seen = 0_u32;
+        let opening_ticks = self.input.ticks();
         loop {
             if ctx.is_cancelled() {
                 log::warn!(
@@ -491,40 +479,26 @@ impl BadgeActivities {
                     anyhow!("no Activity heartbeat acknowledged for {silent_ms} ms").into(),
                 );
             }
-            let buttons = self.sample_buttons()?;
-            let powerup_active = self.powerup_active.load(Ordering::Acquire);
-            ticks += 1;
-            if buttons.any() {
-                presses_seen += 1;
+            if let Some(choice) = self.input.next_choice() {
+                return Ok(choice);
             }
-            // Report unconditionally: a loop that is running and seeing
-            // nothing looks exactly like one that is not running at all, and
-            // only the tick rate separates them. ~100 ticks per report is
-            // healthy; far fewer means the runtime is starving this loop.
+            // The sampler's tick count is the honest health signal now: this
+            // loop being slow only delays an answer, but the sampler stalling
+            // would lose one.
             if last_diagnostic.elapsed() >= INPUT_DIAGNOSTIC_INTERVAL {
                 last_diagnostic = Instant::now();
                 log::warn!(
-                    "Input idle {} ms into attempt {}: state={state:?} buttons={buttons:?} powerup={powerup_active} ticks={ticks} presses_seen={presses_seen} silent_hb={} ms",
+                    "Input idle {} ms into attempt {}: sampler_ticks={} silent_hb={} ms heap={} low={}",
                     opened_at.elapsed().as_millis(),
                     ctx.info().attempt,
-                    heartbeat.silent_ms()
+                    self.input.ticks().saturating_sub(opening_ticks),
+                    heartbeat.silent_ms(),
+                    free_heap(),
+                    lowest_heap()
                 );
-            }
-            let (next, choice) = state.advance(buttons, powerup_active, Instant::now(), PANIC_HOLD);
-            state = next;
-            if let Some(choice) = choice {
-                return Ok(choice);
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-    }
-
-    fn sample_buttons(&self) -> Result<input::Buttons, ActivityError> {
-        Ok(self
-            .input
-            .lock()
-            .map_err(|_| anyhow!("input lock poisoned"))?
-            .sample())
     }
 
     /// Sends one heartbeat and reports what it means, without deciding
@@ -773,12 +747,18 @@ fn main() -> Result<()> {
         peripherals.pins.gpio4,
         peripherals.pins.gpio5,
     )?));
-    let input = Arc::new(Mutex::new(BadgeInput::new(
+    // Owned here rather than in `run_worker` because the button sampler is
+    // started before Temporal is and outlives any one Activity.
+    let activity_active = Arc::new(AtomicBool::new(false));
+    let powerup_active = Arc::new(AtomicBool::new(false));
+    let input = ButtonReader::start(
         peripherals.pins.gpio7,
         peripherals.pins.gpio18,
         peripherals.pins.gpio17,
         peripherals.pins.gpio0,
-    )?));
+        Arc::clone(&activity_active),
+        Arc::clone(&powerup_active),
+    )?;
     let haptic_timer = LedcTimerDriver::new(
         peripherals.ledc.timer0,
         &TimerConfig::new().frequency(Hertz(80)),
@@ -815,16 +795,24 @@ fn main() -> Result<()> {
         .build()
         .context("build single-thread Tokio runtime")?;
     runtime.block_on(Box::pin(run_worker(
-        display, input, haptics, identity, session,
+        display,
+        input,
+        haptics,
+        identity,
+        session,
+        activity_active,
+        powerup_active,
     )))
 }
 
 async fn run_worker(
     display: SharedDisplay,
-    input: SharedInput,
+    input: ButtonReader,
     haptics: SharedHaptics,
     identity: BadgeIdentity,
     session: Arc<SessionStore>,
+    activity_active: Arc<AtomicBool>,
+    powerup_active: Arc<AtomicBool>,
 ) -> Result<()> {
     let runtime_options = RuntimeOptions::builder()
         .heartbeat_interval(Some(WORKER_HEARTBEAT_INTERVAL))
@@ -851,8 +839,6 @@ async fn run_worker(
     // execute two question Activities concurrently.
     let mut tuner = TunerBuilder::default();
     tuner.activity_slot_supplier(Arc::new(FixedSizeSlotSupplier::<ActivitySlotKind>::new(1)));
-    let activity_active = Arc::new(AtomicBool::new(false));
-    let powerup_active = Arc::new(AtomicBool::new(false));
     let point_value = Arc::new(AtomicI32::new(1));
     let current_question = Arc::new(Mutex::new(None));
     let worker_identity = format!("badge/{}", identity.callsign);
@@ -866,12 +852,11 @@ async fn run_worker(
         .register_activities(BadgeActivities {
             display: Arc::clone(&display),
             haptics: Arc::clone(&haptics),
-            input: Arc::clone(&input),
+            input: input.clone(),
             identity: identity.clone(),
             session,
             result_watcher: Mutex::new(None),
             activity_active: Arc::clone(&activity_active),
-            powerup_active: Arc::clone(&powerup_active),
             point_value: Arc::clone(&point_value),
             current_question: Arc::clone(&current_question),
         })
@@ -886,14 +871,14 @@ async fn run_worker(
     show_waiting(&display, &identity.callsign)?;
     #[cfg(feature = "hil")]
     hil::start(
-        Arc::clone(&input),
+        input.clone(),
         Arc::clone(&activity_active),
         Arc::clone(&current_question),
         Arc::clone(&worker_polling),
         identity.callsign.clone(),
     )?;
     let sleep_display = Arc::clone(&display);
-    let sleep_input = Arc::clone(&input);
+    let sleep_input = input.clone();
     let sleep_haptics = Arc::clone(&haptics);
     let sleep_callsign = identity.callsign.clone();
     let powerup_display = Arc::clone(&display);
@@ -945,7 +930,7 @@ async fn monitor_powerups(
     let mut game_id = None;
     let mut sequence = 0;
     let mut consecutive_errors = 0_u32;
-    let mut poll_interval = POWERUP_POLL_IDLE;
+    let mut poll_interval;
     loop {
         match handle
             .query(GameWorkflow::snapshot, (), WorkflowQueryOptions::default())
@@ -1014,6 +999,23 @@ async fn monitor_powerups(
         }
         tokio::time::sleep(poll_interval).await;
     }
+}
+
+/// Free internal heap, in bytes.
+///
+/// Every Activity spawns a heartbeat task and a Signal task, and a busy round
+/// runs forty of them. A badge that panics only under high answer throughput
+/// looks like exhaustion, so the number is worth carrying in the one line the
+/// input loop already prints.
+fn free_heap() -> u32 {
+    // SAFETY: a plain read of an ESP-IDF counter, no arguments, no state.
+    unsafe { esp_idf_svc::sys::esp_get_free_heap_size() }
+}
+
+/// Smallest free heap seen since boot, which is what a slow leak shows up in.
+fn lowest_heap() -> u32 {
+    // SAFETY: as above.
+    unsafe { esp_idf_svc::sys::esp_get_minimum_free_heap_size() }
 }
 
 fn unix_ms() -> u64 {

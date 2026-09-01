@@ -10,7 +10,7 @@ use std::{
 
 use anyhow::{Context, Result};
 
-use crate::{input::BadgeInput, model::QuestionTask};
+use crate::{input::ButtonReader, model::QuestionTask};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const MAX_COMMAND_BYTES: usize = 96;
@@ -27,7 +27,7 @@ const MAX_COMMAND_BYTES: usize = 96;
 /// `HIL ANSWER CORRECT` selects the question's known correct index, while
 /// `HIL ANSWER 0` through `3` exercise an explicit directional mapping.
 pub fn start(
-    input: Arc<Mutex<BadgeInput>>,
+    input: ButtonReader,
     activity_active: Arc<AtomicBool>,
     current_question: Arc<Mutex<Option<QuestionTask>>>,
     worker_polling: Arc<AtomicBool>,
@@ -53,7 +53,7 @@ pub fn start(
 }
 
 fn read_commands(
-    input: Arc<Mutex<BadgeInput>>,
+    input: ButtonReader,
     activity_active: Arc<AtomicBool>,
     current_question: Arc<Mutex<Option<QuestionTask>>>,
     worker_polling: Arc<AtomicBool>,
@@ -104,7 +104,7 @@ fn read_commands(
 
 fn handle_command(
     line: &str,
-    input: &Arc<Mutex<BadgeInput>>,
+    input: &ButtonReader,
     activity_active: &Arc<AtomicBool>,
     current_question: &Arc<Mutex<Option<QuestionTask>>>,
     worker_polling: &Arc<AtomicBool>,
@@ -158,9 +158,7 @@ fn handle_command(
             }
         }
     };
-    let accepted = input
-        .lock()
-        .is_ok_and(|mut badge_input| badge_input.inject_answer(index));
+    let accepted = input.inject_answer(index);
     if accepted {
         log::info!(
             "HIL ACK answer={} question={} callsign={}",

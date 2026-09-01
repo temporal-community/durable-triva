@@ -3,7 +3,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use anyhow::{Result, bail};
@@ -12,7 +12,7 @@ use esp_idf_svc::sys;
 use crate::{
     display::BadgeDisplay,
     haptics::{self, HapticEvent, SharedHaptics},
-    input::BadgeInput,
+    input::ButtonReader,
     with_display_if_idle,
 };
 
@@ -42,29 +42,26 @@ const BUTTON_WAKE_MASK: u64 = (1_u64 << sys::gpio_num_t_GPIO_NUM_0)
 
 pub async fn monitor(
     display: Arc<Mutex<BadgeDisplay>>,
-    input: Arc<Mutex<BadgeInput>>,
+    input: ButtonReader,
     haptics: SharedHaptics,
     activity_active: Arc<AtomicBool>,
     powerup_active: Arc<AtomicBool>,
     callsign: String,
 ) -> Result<()> {
-    let mut down_since: Option<Instant> = None;
     let mut shown_second: Option<u64> = None;
 
     loop {
         if activity_active.load(Ordering::Acquire) || powerup_active.load(Ordering::Acquire) {
-            down_since = None;
             shown_second = None;
             tokio::time::sleep(POLL_INTERVAL).await;
             continue;
         }
 
-        let buttons = input
-            .lock()
-            .map_err(|_| anyhow::anyhow!("input lock poisoned"))?
-            .sample();
-        if !buttons.down {
-            if down_since.take().is_some() && shown_second.take().is_some() {
+        // The button sampler owns the pins and times the hold, so this loop
+        // being slow can delay the countdown but can no longer misread it.
+        let elapsed = input.down_held();
+        if elapsed.is_zero() {
+            if shown_second.take().is_some() {
                 // A question can be assigned between the check at the top of
                 // this loop and here, so ownership is re-tested under the
                 // display lock rather than trusted from a few lines ago.
@@ -75,8 +72,6 @@ pub async fn monitor(
             tokio::time::sleep(POLL_INTERVAL).await;
             continue;
         }
-
-        let elapsed = down_since.get_or_insert_with(Instant::now).elapsed();
         if elapsed >= SLEEP_HOLD {
             log::info!("DOWN held for 3 seconds; entering deep sleep");
             if shown_second != Some(0) {
@@ -91,17 +86,11 @@ pub async fn monitor(
             })? {
                 // A question arrived while the countdown was finishing. The
                 // player is in a round now; sleeping would drop them out of it.
-                down_since = None;
                 shown_second = None;
                 tokio::time::sleep(POLL_INTERVAL).await;
                 continue;
             }
-            while input
-                .lock()
-                .map_err(|_| anyhow::anyhow!("input lock poisoned"))?
-                .sample()
-                .any()
-            {
+            while !input.all_released() {
                 tokio::time::sleep(POLL_INTERVAL).await;
             }
             with_display_if_idle(&display, &activity_active, |screen| screen.power_off())?;
