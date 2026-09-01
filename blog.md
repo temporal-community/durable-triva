@@ -1034,3 +1034,21 @@
   Both polling badges received simultaneous attempt-1 questions, scored one
   correct answer each, immediately received attempt-1 follow-ups, and returned
   to waiting. The two-badge HIL runner printed `PASS`.
+
+## 2026-09-01 — Final human button acceptance before GitHub
+
+- Started a normal no-override round with both connected badges idle. The only
+  USB command sent was read-only `HIL STATUS`; no answer injection was used.
+- Physical button presses produced five scored answers before the final crash
+  gesture: Raven recorded one correct and one wrong answer, while Seal recorded
+  one correct and two wrong answers. Each completed Activity was followed by a
+  new attempt-1 question, confirming both badges stayed fed with work.
+- A later physical LEFT+RIGHT gesture on Seal entered the documented 16-second
+  heartbeat blackout and the Workflow recorded one panic for its current
+  question. The gesture landed at the round deadline, so the Activity was not
+  reassigned before Workflow completion; this run therefore validates crash
+  detection, not retry handoff timing.
+- The round finished with zero heartbeat timeouts or reassignments from normal
+  play. Raven and Seal both logged their five-second result hold and return to
+  waiting. This completes the requested final human switch check; optical OLED
+  inspection, haptic feel, and sleep/wake remain separate hands-on boundaries.
