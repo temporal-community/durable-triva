@@ -1025,3 +1025,12 @@
   their recorded one-reserve command sequence, while new runs record the patch
   marker and schedule every participant. This addresses the upgrade warning at
   its source instead of relying on a new round to replace the latest history.
+- A first run after adding the marker necessarily encountered the local
+  post-change/pre-marker test history and logged one final nondeterminism
+  warning; that history cannot be retroactively marked. The run created a new
+  patched latest history and otherwise passed.
+- The subsequent steady-state run, Workflow
+  `trivia-55c0bdbc5a074998b59adcc0d91456cf`, produced no nondeterminism warning.
+  Both polling badges received simultaneous attempt-1 questions, scored one
+  correct answer each, immediately received attempt-1 follow-ups, and returned
+  to waiting. The two-badge HIL runner printed `PASS`.
