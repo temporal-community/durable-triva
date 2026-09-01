@@ -13,6 +13,11 @@ CONFIG_ESP_TASK_WDT_TIMEOUT_S=60
 # the priority-1 main task before it could reach Wi-Fi. The same quantisation
 # is why the Activity's 20 ms input loop measured 36 ms per turn.
 CONFIG_FREERTOS_HZ=1000
+# Needed by uxTaskGetSystemState, which is how the firmware reports the stack
+# headroom of every task rather than only the three it creates itself. The
+# canary fires on whichever task overflows, and ESP-IDF's own wifi and tcpip
+# tasks were the ones nobody had measured.
+CONFIG_FREERTOS_USE_TRACE_FACILITY=y
 # A stack overflow was double-faulting, which loses the backtrace and the task
 # name and leaves only `_DoubleExceptionVector`. The end-of-stack watchpoint
 # traps the overflow at the boundary instead, so the panic names the task that

@@ -31,69 +31,27 @@
 
 ---
 
-## Open — badge input latency
+## Resolved — badge input latency
 
-**Reported:** 2026-08-31, from handling a physical badge. Presses "seemed to need to be held for a long time" before registering.
+**Reported:** 2026-08-31. **Closed:** 2026-09-01, on hardware.
 
-### What is actually happening
+The diagnosis in the original entry was right about the shape and wrong about
+the size. Sampling really did start late, but the dominant cost turned out to
+be something this entry could not have seen without instrumentation: the input
+loop shared a thread with the Temporal Worker, and the Worker's TLS work is
+CPU-bound. Measured on `KEEN-RAVEN-C8`, sampling fell from 28 Hz to 6 Hz
+whenever the connection retried, and a press shorter than the gap between two
+samples was not delayed but lost. One press took 8.5 seconds to register.
 
-Not a debounce or a hold threshold — there is neither. `BadgeInput::sample()` reads `is_low()` on four `Pull::Up` GPIOs, and the only timers in the input path are the 20 ms poll interval and `PANIC_HOLD` (500 ms, and only for LEFT+RIGHT together). A single press should register in about 20 ms.
+Buttons are now sampled on their own FreeRTOS task and the recognised gesture
+is queued, so the Activity can be starved and still lose nothing. The screen,
+the buttons and the motor moved to that thread with them, which also retired
+the ownership problem the four-writer display had. Answers per round went from
+4 to 38.
 
-Three things stop it, in order of cost:
-
-| # | Cause | Cost |
-| --- | --- | --- |
-| 1 | Nothing samples the buttons until the `badge_started` Signal has been awaited | up to `GAME_SIGNAL_TIMEOUT` = **750 ms**, plus two NVS flash operations |
-| 2 | `wait_for_choice` opens by draining whatever is already held, and discards it | consumes the press entirely |
-| 3 | LEFT and RIGHT answer on release, not on press | by design |
-
-In `answer_question` the order is: draw → `begin_game` (NVS write) → `start_result_watcher` → **await the Signal** → `is_abandoned` (NVS read) → `wait_for_choice`. The question is on screen for that whole window with nothing reading the buttons.
-
-Then `wait_for_choice` starts with `while self.sample_buttons()?.any() { sleep(20 ms) }`. If the player is still holding when sampling finally begins, that loop waits for release and enters the main loop with nothing armed. The press is discarded, not queued.
-
-Net effect: **the first press after a question appears is normally eaten**, and the press that works is a later one. Subjectively that is indistinguishable from "I had to hold it."
-
-Cause 3 is correct and stays — the panic combo has to get a chance to be recognised before either side release counts as an answer. It is listed because it explains why the symptom is worse on LEFT/RIGHT than on UP/DOWN, which is a useful thing to confirm on hardware.
-
-### Constraint the fix must not break
-
-The Signal currently precedes the `is_abandoned` check **deliberately**, and the comment at that call site says why: every real Temporal attempt must be reported before this Worker refuses a question it already abandoned, so the public attempt count stays aligned with `ActivityContext` even when the same badge polls a retry. Any reordering has to keep the Signal *sent* before the abandon path returns.
-
-### Proposed fix — overlap the Signal with the wait, do not drop it
-
-Start the Signal, then run it concurrently with `wait_for_choice` rather than before it:
-
-1. `show_question`
-2. `begin_game` (NVS)
-3. `start_result_watcher`
-4. Build the Signal future — do **not** await it yet
-5. If `is_abandoned`: await the Signal future (still bounded by `GAME_SIGNAL_TIMEOUT`), then the existing 250 ms sleep and early `Err` — constraint preserved
-6. Otherwise `join!` the Signal future with `wait_for_choice`
-
-Sampling then begins within milliseconds of the question appearing, and the 750 ms overlaps the player's thinking time instead of preceding it. Total Activity time is unchanged: `join!` finishes at `max(signal, choice)`, and the choice is always the longer of the two.
-
-**Why `join!` and not `tokio::spawn`.** Spawning is simpler but changes when the Signal can land relative to the Activity completing. An orphaned task could deliver `badge_started` after a retry has already started on another badge, which the Workflow would read as a spurious handoff — `is_reassignment` compares badge id and attempt against `assignments`, and it has no way to know the Signal is stale. `join!` keeps the Signal inside the Activity's own lifetime, exactly as today; only its position moves.
-
-**Left alone:** the drain loop. It exists so a press meant for the previous screen does not leak into this question, which is right. Its problem is only that it currently runs a second late; once sampling starts promptly, it drains a press that is genuinely stale rather than the player's first real attempt.
-
-### Verify before and after
-
-The wall-clock cost is unmeasured — the 750 ms is a ceiling, not an observation, and the two NVS operations are unquantified. Land instrumentation first:
-
-- `log::info!` with `Instant::now()` deltas either side of the Signal await and either side of the drain loop, on a real badge against the real Cloud namespace.
-- Confirm the asymmetry the analysis predicts: UP/DOWN should already feel better than LEFT/RIGHT, since only the latter wait for release.
-
-Then re-measure the same two deltas after the change. Expected: the pre-sampling gap drops from "hundreds of ms" to the NVS write alone.
-
-No host test can cover this — it is ordering inside an Activity against a live Temporal connection. `badge-input`'s 11 tests already cover what a press *means* once sampled; this is about when sampling starts.
-
-### Not doing
-
-- **Debouncing.** No evidence it is needed: bounce would produce spurious extra presses, and the reported symptom is missed ones. Revisit only if instrumentation shows double-fires.
-- **Shortening the 20 ms poll.** It is not the bottleneck, and it is what bounds the crossover window that used to wedge the side buttons.
-- **Moving `begin_game` off the critical path.** It must precede input: it is what records the round that `is_abandoned` and the panic path read.
-
----
+The constraint this entry set out — that `badge_started` must be reported
+before the abandon path returns, and must not outlive its Activity — still
+holds and is honoured with `join!`, for the reason argued below.
 
 ## What "VERIFIED" means in the source docs
 

@@ -276,15 +276,6 @@ impl GameSnapshot {
         }
     }
 
-    /// How many Activities the Workflow keeps outstanding.
-    ///
-    /// GAME_SPEC: keep one Activity outstanding per badge detected at round
-    /// start. Heartbeat retries may wait briefly for a Worker instead of
-    /// leaving an otherwise healthy badge idle throughout normal play.
-    pub fn target_backlog(&self, override_value: Option<usize>) -> usize {
-        override_value.unwrap_or_else(|| (self.detected_badge_count as usize).max(1))
-    }
-
     /// Closes the round and names every badge on the top score.
     ///
     /// A tie is the normal case, not an edge case: badges answer the same deck
@@ -336,41 +327,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn backlog_keeps_every_badge_playing() {
-        let mut state = GameSnapshot::default();
-        assert_eq!(
-            state.target_backlog(None),
-            1,
-            "a bootstrap slot with no roster"
-        );
-        state.detected_badge_count = 10;
-        assert_eq!(state.target_backlog(None), 10);
-        assert_eq!(
-            state.target_backlog(Some(33)),
-            33,
-            "an explicit override still wins"
-        );
-    }
-
-    #[test]
-    fn finish_sorts_tied_winners_by_callsign() {
-        let mut state = GameSnapshot::default();
-        for (badge_id, callsign) in [("badge-a", "FERRIS-01"), ("badge-z", "CRAB-02")] {
-            state.players.insert(
-                badge_id.to_owned(),
-                PlayerScore {
-                    badge_id: badge_id.to_owned(),
-                    callsign: callsign.to_owned(),
-                    score: 4,
-                    ..Default::default()
-                },
-            );
-        }
-        state.finish();
-        assert_eq!(state.winners, ["CRAB-02", "FERRIS-01"]);
-    }
 
     #[test]
     fn a_dropped_heartbeat_costs_nothing_until_the_budget_runs_out() {

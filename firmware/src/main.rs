@@ -262,11 +262,18 @@ impl BadgeActivities {
         // never answer, and the NVS write and heartbeat RPCs behind it were
         // three Cloud round trips spent to say no. The Signal still reports
         // the attempt, but it is spawned and costs this path nothing.
+        // Built, not started: an async fn does nothing until it is awaited, so
+        // this decides *when* the attempt is reported without deciding whether.
+        let report_attempt = Self::badge_started_signal(&ctx, event.clone());
+
         if self
             .session
             .is_abandoned(&task.game_id, &task.question.id)?
         {
-            self.signal_badge_started(&ctx, event);
+            // The constraint from docs/planned-changes.md: every real Temporal
+            // attempt is reported before the abandon path returns, so the
+            // public attempt count stays aligned with ActivityContext.
+            report_attempt.await;
             log::warn!(
                 "Refusing abandoned question {}; leaving it for another Worker",
                 task.question.id
@@ -291,7 +298,6 @@ impl BadgeActivities {
         let heartbeat = Self::spawn_heartbeat(&ctx);
         self.session
             .begin_game(&task.game_id, task.deadline_unix_ms)?;
-        self.signal_badge_started(&ctx, event.clone());
         log::info!(
             "Question {} preparation complete (heap={} low={})",
             task.question.id,
@@ -300,10 +306,18 @@ impl BadgeActivities {
         );
 
         let activity_deadline_unix_ms = task.latest_possible_deadline_unix_ms();
-        match self
-            .wait_for_choice(&ctx, &heartbeat, activity_deadline_unix_ms)
-            .await?
-        {
+        // Report the attempt alongside the wait rather than before it. A
+        // detached task would be simpler, but an orphan can deliver
+        // `badge_started` after a retry has begun on another badge, and the
+        // Workflow would then attribute the next handoff to the wrong badge.
+        // `join` keeps the Signal inside this Activity's own lifetime, and the
+        // wait is always the longer of the two, so it costs nothing.
+        let (choice, ()) = futures::future::join(
+            self.wait_for_choice(&ctx, &heartbeat, activity_deadline_unix_ms),
+            report_attempt,
+        )
+        .await;
+        match choice? {
             Choice::Answer(selected_index) => {
                 log::info!(
                     "Input selected answer={} question={}",
@@ -553,31 +567,30 @@ impl BadgeActivities {
         }
     }
 
-    /// Reports a real Temporal attempt to the Workflow, off the critical path.
+    /// Reports a real Temporal attempt to the Workflow.
     ///
-    /// Observational telemetry, not part of accepting an answer: on the ESP32
+    /// Observational telemetry, not part of accepting an answer, so it is
+    /// bounded and its failures are logged rather than returned: on the ESP32
     /// runtime an unhealthy Signal has outlived its local timeout and let the
     /// server heartbeat timeout expire behind it.
-    fn signal_badge_started(&self, ctx: &ActivityContext, event: BadgeEvent) {
+    async fn badge_started_signal(ctx: &ActivityContext, event: BadgeEvent) {
         let Some(handle) = ctx.workflow_handle::<GameWorkflow>() else {
             return;
         };
-        tokio::spawn(async move {
-            match tokio::time::timeout(
-                GAME_SIGNAL_TIMEOUT,
-                handle.signal(
-                    GameWorkflow::badge_started,
-                    event,
-                    WorkflowSignalOptions::default(),
-                ),
-            )
-            .await
-            {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => log::warn!("could not signal badge start: {error}"),
-                Err(_) => log::warn!("badge start Signal exceeded 750 ms; continuing Activity"),
-            }
-        });
+        match tokio::time::timeout(
+            GAME_SIGNAL_TIMEOUT,
+            handle.signal(
+                GameWorkflow::badge_started,
+                event,
+                WorkflowSignalOptions::default(),
+            ),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => log::warn!("could not signal badge start: {error}"),
+            Err(_) => log::warn!("badge start Signal exceeded 750 ms; continuing Activity"),
+        }
     }
 
     fn start_result_watcher(
@@ -658,6 +671,7 @@ impl BadgeActivities {
 fn main() -> Result<()> {
     esp_idf_svc::sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
+    install_panic_reporter();
     validate_config()?;
     let identity = factory_identity()?;
     log::info!("Temporal Trivia badge booting as {}", identity.callsign);
@@ -874,6 +888,31 @@ fn unix_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+/// Reports a Rust panic before the process aborts.
+///
+/// Every badge fault so far has been a `BREAK` followed by a double exception
+/// in the handler itself, which loses the message and the backtrace with it.
+/// A panic hook runs first, while the stack is still whatever the panicking
+/// code left, and `log::error!` reaches the UART without waiting for a
+/// handler that may not survive. If a fault prints nothing from here, it was
+/// never a Rust panic and the search moves to ESP-IDF.
+fn install_panic_reporter() {
+    std::panic::set_hook(Box::new(|info| {
+        let location = info
+            .location()
+            .map_or_else(|| "unknown".to_owned(), ToString::to_string);
+        log::error!(
+            "RUST PANIC at {location}: {}",
+            info.payload_as_str().unwrap_or("<no message>")
+        );
+        log::error!(
+            "panicking task stack headroom: {} bytes",
+            ui::stack_headroom()
+        );
+        ui::log_every_task_stack();
+    }));
 }
 
 fn validate_config() -> Result<()> {

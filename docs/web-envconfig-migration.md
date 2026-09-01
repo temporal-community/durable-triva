@@ -1,8 +1,11 @@
 # Migration draft — `web/` credential loading onto the SDK's `envconfig`
 
 **Date:** 2026-08-27
-**Status:** drafted and compiled in a scratch copy of the workspace. Nothing in the repo was modified.
-**Patch:** `web-envconfig-migration.diff` (5 files, +164 / −141) — apply from the repo root with `git apply`.
+**Status:** **landed.** `web/src/cloud.rs` resolves credentials through
+`temporalio_common::envconfig`, and both operator binaries share it. The draft
+patch that used to sit beside this file has been deleted: it described changes
+that are now in the tree, so applying it would have conflicted with the code it
+was meant to produce. This file is kept for the reasoning, not as a to-do.
 
 ## Why
 

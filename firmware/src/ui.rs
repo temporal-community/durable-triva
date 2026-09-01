@@ -68,6 +68,41 @@ pub fn stack_headroom() -> u32 {
     unsafe { esp_idf_svc::sys::uxTaskGetStackHighWaterMark(std::ptr::null_mut()) }
 }
 
+/// Reports the worst-case stack headroom of every task in the system.
+///
+/// The three this firmware creates are not the only ones that can overflow,
+/// and the canary fires on whichever does, so a full sweep is the only way to
+/// know. Everything here is deliberately kept off the caller's stack: the
+/// first version put a 32-entry status array and a Vec of formatted names on
+/// it, cost 7 KiB, and left the UI thread it was measuring with 876 bytes --
+/// a measurement that endangers its subject measures nothing.
+pub fn log_every_task_stack() {
+    const MAX_TASKS: usize = 24;
+    // SAFETY: FreeRTOS fills at most `MAX_TASKS` entries of a heap buffer we
+    // own and sized, and returns how many it wrote. A null run-time pointer
+    // means "no run-time stats", which this build does not enable.
+    let mut statuses: Box<[esp_idf_svc::sys::TaskStatus_t; MAX_TASKS]> =
+        Box::new(unsafe { std::mem::zeroed() });
+    let count = unsafe {
+        esp_idf_svc::sys::uxTaskGetSystemState(
+            statuses.as_mut_ptr(),
+            MAX_TASKS as u32,
+            std::ptr::null_mut(),
+        ) as usize
+    }
+    .min(MAX_TASKS);
+    for status in &statuses[..count] {
+        // SAFETY: FreeRTOS always points pcTaskName at a NUL-terminated name
+        // that outlives this read.
+        let name = unsafe { std::ffi::CStr::from_ptr(status.pcTaskName) };
+        log::warn!(
+            "task stack headroom: {:>6} bytes  {}",
+            status.usStackHighWaterMark,
+            name.to_string_lossy()
+        );
+    }
+}
+
 /// A screen the Temporal side wants shown.
 ///
 /// Sequencing stays with the caller: it already knows whether a wrong answer
@@ -233,9 +268,9 @@ pub fn start(
     };
     thread::Builder::new()
         .name("badge-ui".to_owned())
-        // Drawing formats several strings and a panic unwinding through here
-        // needs room to report itself.
-        .stack_size(12 * 1024)
+        // Drawing formats several strings, and a panic unwinding through here
+        // needs room to report itself before the handler runs.
+        .stack_size(16 * 1024)
         .spawn(move || {
             let mut state = UiThread {
                 display,
@@ -297,7 +332,7 @@ impl UiThread {
             self.advance_sleep(buttons, now);
             if self.last_stack_report.elapsed() >= STACK_REPORT_INTERVAL {
                 self.last_stack_report = now;
-                log::info!("ui thread stack headroom: {} bytes", stack_headroom());
+                log_every_task_stack();
             }
             self.shared.ticks.fetch_add(1, Ordering::Release);
             thread::sleep(TICK);
