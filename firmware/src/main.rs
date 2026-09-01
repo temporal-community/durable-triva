@@ -97,6 +97,7 @@ const ABANDONED_REFUSAL_BACKOFF: Duration = Duration::from_millis(250);
 /// do exactly that, for the whole life of a question, and neither said a word.
 const INPUT_DIAGNOSTIC_INTERVAL: Duration = Duration::from_millis(2_000);
 
+#[cfg(feature = "hil")]
 type SharedQuestion = Arc<Mutex<Option<QuestionTask>>>;
 
 #[workflow]
@@ -135,7 +136,12 @@ struct BadgeActivities {
     identity: BadgeIdentity,
     session: Arc<SessionStore>,
     result_watcher: Mutex<Option<ResultWatcher>>,
+    /// Only the USB acceptance harness reads these. The UI thread already
+    /// knows whether a question owns the controls, so a shipped badge has no
+    /// reason to maintain a second copy of the answer.
+    #[cfg(feature = "hil")]
     activity_active: Arc<AtomicBool>,
+    #[cfg(feature = "hil")]
     current_question: SharedQuestion,
     /// Points a correct answer is currently worth, refreshed by the power-up
     /// poller. The badge shows feedback before the Workflow scores the answer,
@@ -199,10 +205,13 @@ struct ResultWatcher {
     task: tokio::task::JoinHandle<()>,
 }
 
+#[cfg(feature = "hil")]
 struct ActivityActiveGuard(Arc<AtomicBool>);
 
+#[cfg(feature = "hil")]
 struct CurrentQuestionGuard(SharedQuestion);
 
+#[cfg(feature = "hil")]
 impl ActivityActiveGuard {
     fn new(active: Arc<AtomicBool>) -> Self {
         active.store(true, Ordering::Release);
@@ -210,12 +219,14 @@ impl ActivityActiveGuard {
     }
 }
 
+#[cfg(feature = "hil")]
 impl Drop for ActivityActiveGuard {
     fn drop(&mut self) {
         self.0.store(false, Ordering::Release);
     }
 }
 
+#[cfg(feature = "hil")]
 impl CurrentQuestionGuard {
     fn new(current: SharedQuestion, task: QuestionTask) -> Result<Self, ActivityError> {
         *current
@@ -225,6 +236,7 @@ impl CurrentQuestionGuard {
     }
 }
 
+#[cfg(feature = "hil")]
 impl Drop for CurrentQuestionGuard {
     fn drop(&mut self) {
         if let Ok(mut current) = self.0.lock() {
@@ -282,7 +294,9 @@ impl BadgeActivities {
             return Err(anyhow!("badge already abandoned this question").into());
         }
 
+        #[cfg(feature = "hil")]
         let _active = ActivityActiveGuard::new(Arc::clone(&self.activity_active));
+        #[cfg(feature = "hil")]
         let _current = CurrentQuestionGuard::new(Arc::clone(&self.current_question), task.clone())?;
         // Retire a watcher still holding the previous round's standings before
         // anything is drawn. It restores the waiting screen when its hold ends,
@@ -728,11 +742,31 @@ fn main() -> Result<()> {
     let _eventfs = MountedEventfs::mount(5).context("mount eventfd VFS for Tokio")?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
+        // A current-thread runtime still carries a blocking pool, and its
+        // default ceiling is 512 threads. Every reconnect resolves DNS through
+        // spawn_blocking, so a badge on a flaky link accumulates threads --
+        // and a FreeRTOS task stack has to come from internal DRAM, of which
+        // this chip has about 512 KiB no matter how much PSRAM is fitted.
+        // Exhausting it makes newlib's lock_init_generic fail to allocate a
+        // semaphore and abort(), which is the fault this firmware spent an
+        // evening chasing. Two is more than the badge ever needs at once.
+        .max_blocking_threads(2)
+        // Keep those two rather than paying to recreate them every reconnect.
+        .thread_keep_alive(Duration::from_secs(600))
         .build()
         .context("build single-thread Tokio runtime")?;
-    runtime.block_on(Box::pin(run_worker(ui, identity, session)))
+    // Anything that reaches here is a badge that has stopped working, so a
+    // setup failure reboots for the same reason the Worker's own exit does.
+    match runtime.block_on(Box::pin(run_worker(ui, identity, session))) {
+        Ok(()) => log::error!("badge Worker returned unexpectedly"),
+        Err(error) => log::error!("badge Worker could not start: {error:#}"),
+    }
+    restart()
 }
 
+/// Runs the badge's Temporal Worker. Only ever leaves by rebooting: the `?`
+/// paths below are setup failures, and everything after them ends in
+/// [`restart`].
 async fn run_worker(ui: Ui, identity: BadgeIdentity, session: Arc<SessionStore>) -> Result<()> {
     let runtime_options = RuntimeOptions::builder()
         .heartbeat_interval(Some(WORKER_HEARTBEAT_INTERVAL))
@@ -760,7 +794,9 @@ async fn run_worker(ui: Ui, identity: BadgeIdentity, session: Arc<SessionStore>)
     let mut tuner = TunerBuilder::default();
     tuner.activity_slot_supplier(Arc::new(FixedSizeSlotSupplier::<ActivitySlotKind>::new(1)));
     let point_value = Arc::new(AtomicI32::new(1));
+    #[cfg(feature = "hil")]
     let activity_active = Arc::new(AtomicBool::new(false));
+    #[cfg(feature = "hil")]
     let current_question = Arc::new(Mutex::new(None));
     let worker_identity = format!("badge/{}", identity.callsign);
     let worker_options = WorkerOptions::new(BADGE_TASK_QUEUE)
@@ -775,8 +811,10 @@ async fn run_worker(ui: Ui, identity: BadgeIdentity, session: Arc<SessionStore>)
             identity: identity.clone(),
             session,
             result_watcher: Mutex::new(None),
+            #[cfg(feature = "hil")]
             activity_active: Arc::clone(&activity_active),
             point_value: Arc::clone(&point_value),
+            #[cfg(feature = "hil")]
             current_question: Arc::clone(&current_question),
         })
         .build();
@@ -802,8 +840,28 @@ async fn run_worker(ui: Ui, identity: BadgeIdentity, session: Arc<SessionStore>)
     });
     log::info!("Polling trivia queue {BADGE_TASK_QUEUE} as {worker_identity}");
     worker_polling.store(true, Ordering::Release);
-    worker.run().await?;
-    Ok(())
+
+    // `worker.run()` returning at all means this badge has stopped polling.
+    // Letting that unwind out of `main` runs every destructor and leaves the
+    // board powered, lit and useless until somebody unplugs it -- which reads
+    // to a player exactly like a badge frozen on the waiting screen. A soak
+    // caught both badges doing this within a second of each other after ten
+    // minutes, silently. There is nothing a stopped Worker can do but come
+    // back, so say why and reboot into a fresh connection.
+    match worker.run().await {
+        Ok(()) => log::error!("Temporal Worker stopped on its own; restarting the badge"),
+        Err(error) => log::error!("Temporal Worker failed: {error}; restarting the badge"),
+    }
+    worker_polling.store(false, Ordering::Release);
+    restart()
+}
+
+/// Reboots the badge. Never returns.
+fn restart() -> ! {
+    // Give the log a moment to drain before the reset takes the UART with it.
+    std::thread::sleep(Duration::from_millis(250));
+    // SAFETY: an unconditional ESP-IDF reset with no arguments and no state.
+    unsafe { esp_idf_svc::sys::esp_restart() }
 }
 
 async fn monitor_powerups(client: Client, ui: Ui, point_value: Arc<AtomicI32>) {
@@ -866,21 +924,31 @@ async fn monitor_powerups(client: Client, ui: Ui, point_value: Arc<AtomicI32>) {
     }
 }
 
-/// Free internal heap, in bytes.
+/// Free *internal* heap, in bytes.
+///
+/// The distinction is the whole point. `esp_get_free_heap_size` counts PSRAM
+/// too, and reported 8.2 MB free at the moment of a crash caused by internal
+/// DRAM exhaustion. FreeRTOS objects and task stacks can only come from
+/// internal memory, so that is the number worth watching.
 ///
 /// Every Activity spawns a heartbeat task and a Signal task, and a busy round
 /// runs forty of them. A badge that panics only under high answer throughput
 /// looks like exhaustion, so the number is worth carrying in the one line the
 /// input loop already prints.
 fn free_heap() -> u32 {
-    // SAFETY: a plain read of an ESP-IDF counter, no arguments, no state.
-    unsafe { esp_idf_svc::sys::esp_get_free_heap_size() }
+    // SAFETY: a plain size query against the allocator, no state involved.
+    unsafe {
+        esp_idf_svc::sys::heap_caps_get_free_size(esp_idf_svc::sys::MALLOC_CAP_INTERNAL) as u32
+    }
 }
 
-/// Smallest free heap seen since boot, which is what a slow leak shows up in.
+/// Smallest free internal heap seen since boot, where a slow leak shows up.
 fn lowest_heap() -> u32 {
     // SAFETY: as above.
-    unsafe { esp_idf_svc::sys::esp_get_minimum_free_heap_size() }
+    unsafe {
+        esp_idf_svc::sys::heap_caps_get_minimum_free_size(esp_idf_svc::sys::MALLOC_CAP_INTERNAL)
+            as u32
+    }
 }
 
 fn unix_ms() -> u64 {

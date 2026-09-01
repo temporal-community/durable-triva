@@ -53,6 +53,9 @@ FAULT_PATTERNS = (
     r"Brownout",
     r"rst:0x[0-9a-f]+ \((?!USB_UART_CHIP_RESET)",
 )
+# A badge whose Worker exits stops saying anything at all, and until this was
+# a fault the soak sat waiting on it for ten minutes and reported nothing.
+SILENCE_IS_A_FAULT = 90.0
 BOOT_MARKER = "Temporal Trivia badge booting as"
 POLLING_MARKER = "Polling trivia queue"
 
@@ -90,6 +93,7 @@ class BadgePort:
     _last_line_at: float = field(default_factory=time.monotonic, init=False)
     _pending_fault: Fault | None = field(default=None, init=False)
     _fault_tail: int = field(default=0, init=False)
+    _reported_silence: bool = field(default=False, init=False)
 
     def open(self) -> None:
         """Open without intentionally toggling reset and start capturing."""
@@ -133,6 +137,25 @@ class BadgePort:
         """Seconds since this badge last said anything at all."""
         with self._condition:
             return time.monotonic() - self._last_line_at
+
+    def check_alive(self) -> bool:
+        """Record a fault if this badge has gone quiet. True while healthy."""
+        quiet = self.silent_for()
+        if quiet < SILENCE_IS_A_FAULT or self._reported_silence:
+            return quiet < SILENCE_IS_A_FAULT
+        self._reported_silence = True
+        line = f"no serial output for {quiet:.0f}s -- Worker stopped or badge hung"
+        print(f"\n!! [{self.name}] FAULT: {line}", flush=True)
+        with self._condition:
+            self.faults.append(
+                Fault(
+                    badge=self.name,
+                    kind="silence",
+                    line=line,
+                    context=list(self._recent),
+                )
+            )
+        return False
 
     def wait_for(self, pattern: str, timeout: float, *, after: int = 0) -> str | None:
         """Wait for a matching line newer than ``after``; None on timeout."""
@@ -201,6 +224,7 @@ class BadgePort:
                 with self._condition:
                     self._sequence += 1
                     self._last_line_at = time.monotonic()
+                    self._reported_silence = False
                     self._lines.append((self._sequence, line))
                     self._recent.append(line)
                     self._note_fault(line)
@@ -324,6 +348,7 @@ def play_round(
         if game_status(controller) == "finished":
             return inputs
         for badge in badges:
+            badge.check_alive()
             match = badge.status(timeout=3.0)
             if match is None:
                 continue
@@ -396,7 +421,11 @@ def run_soak(
         for index in range(1, rounds + 1):
             for badge in badges:
                 if not badge.await_ready(120.0):
-                    print(f"[{badge.name}] never reported polling; continuing anyway")
+                    badge.check_alive()
+                    print(
+                        f"[{badge.name}] never reported polling; continuing anyway",
+                        flush=True,
+                    )
             deadline = time.monotonic() + 90
             while listed_badges(controller) < {
                 cast(str, badge.callsign) for badge in badges
@@ -423,8 +452,7 @@ def run_soak(
             while time.monotonic() < quiet_until:
                 time.sleep(1.0)
                 for badge in badges:
-                    if badge.silent_for() > 240:
-                        print(f"!! [{badge.name}] silent for 4 minutes")
+                    badge.check_alive()
             for badge in badges:
                 if badge.faults:
                     print(f"  {badge.name}: {len(badge.faults)} fault(s) so far")
