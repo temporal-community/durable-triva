@@ -978,3 +978,20 @@
   scoring, and post-result readiness. It does not optically inspect OLED pixels
   or physically confirm haptic strength, face-button mechanics, sleep/wake, or
   the deliberate crash gesture.
+
+## 2026-09-01 — Every connected badge gets a question
+
+- A normal two-badge round assigned only Seal while Raven waited. This was not
+  a connection failure: the Workflow deliberately subtracted one from the
+  detected badge count to keep a recovery reserve, so two badges produced only
+  one outstanding question Activity.
+- The desired player experience is for every connected badge to keep playing.
+  The default backlog now has one outstanding badge Activity per badge detected
+  at round start. Registered phones likewise receive one slot each; a
+  phone-only round retains one bootstrap Activity before the first phone joins.
+- The tradeoff is explicit: a heartbeat retry may wait until a Worker becomes
+  available instead of idling one healthy player for the entire normal round.
+  The diagnostic backlog override remains available.
+- Updated the game contract, controller guide, event text, shared backlog test,
+  and Workflow target test. The running controller still needs to be rebuilt
+  and restarted before live acceptance of this scheduler change.

@@ -50,11 +50,12 @@ digest matching the frozen board.
 ## Run a game
 
 Click **START ROUND** after badges are polling. Only one round can run at a
-time. The controller counts active ESP32 Activity pollers and keeps one badge
-free as recovery capacity, so two badges run one Activity at a time and ten
-badges run nine. A single-badge game still runs one Activity. Badges that begin
-polling during an active round can claim later work, but the recovery capacity
-is fixed from the roster detected at round start.
+time. The controller counts active ESP32 Activity pollers and keeps one
+question Activity outstanding per detected badge, so both badges in a
+two-badge game receive work. Badges that begin polling during an active round
+can claim later work, but the badge target is fixed from the roster detected at
+round start. A heartbeat retry may wait briefly for a Worker instead of keeping
+a healthy badge idle throughout normal play.
 
 Open the operator tray with the small **TP7** test pad in the bottom-right
 corner or the `O` keyboard shortcut. It rises from the bottom edge and the

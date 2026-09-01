@@ -97,21 +97,15 @@ impl GameWorkflow {
             };
             state.snapshot.push_event("Round started".to_owned());
             if let Some(badge_count) = input.detected_badge_count {
-                let active_slots = input
-                    .backlog_override
-                    .unwrap_or_else(|| badge_count.saturating_sub(1).max(1));
+                let active_slots = input.backlog_override.unwrap_or(badge_count);
                 if badge_count == 0 {
                     state
                         .snapshot
                         .push_event("Phone-only round ready · waiting for players".to_owned());
-                } else if badge_count > 1 {
-                    state.snapshot.push_event(format!(
-                        "{badge_count} badges ready · {active_slots} playing · 1 recovery reserve"
-                    ));
                 } else {
-                    state
-                        .snapshot
-                        .push_event("1 badge ready · no recovery reserve".to_owned());
+                    state.snapshot.push_event(format!(
+                        "{badge_count} badges ready · {active_slots} question slots"
+                    ));
                 }
             }
         });
@@ -777,17 +771,10 @@ fn active_points(snapshot: &GameSnapshot, now_unix_ms: u64) -> i32 {
 fn activity_targets(snapshot: &GameSnapshot, override_value: Option<usize>) -> (usize, usize) {
     let badges = snapshot.detected_badge_count as usize;
     let phones = snapshot.registered_phone_count as usize;
-    let badge_target = override_value.unwrap_or_else(|| {
-        if badges == 0 {
-            0
-        } else {
-            badges.saturating_sub(1).max(1)
-        }
-    });
+    let badge_target = override_value.unwrap_or(badges);
     let phone_target = if badges == 0 {
         // Bootstrap a phone-only round before the first browser can register.
-        // Once phones join, retain one global recovery slot.
-        phones.saturating_sub(1).max(1)
+        phones.max(1)
     } else {
         phones
     };
@@ -963,6 +950,19 @@ mod tests {
     #[test]
     fn unix_time_conversion_is_milliseconds() {
         assert_eq!(unix_ms(UNIX_EPOCH + Duration::from_secs(3)), 3_000);
+    }
+
+    #[test]
+    fn every_connected_badge_gets_a_question_slot() {
+        let mut snapshot = GameSnapshot {
+            detected_badge_count: 2,
+            ..Default::default()
+        };
+        assert_eq!(activity_targets(&snapshot, None), (2, 0));
+
+        snapshot.registered_phone_count = 3;
+        assert_eq!(activity_targets(&snapshot, None), (2, 3));
+        assert_eq!(activity_targets(&snapshot, Some(1)), (1, 3));
     }
 
     #[test]

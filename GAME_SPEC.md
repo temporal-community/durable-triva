@@ -12,15 +12,16 @@
   those values become `+2` and `-2`. Activity retries are reserved for genuine
   Worker loss and heartbeat timeout.
 - Holding LEFT+RIGHT for 500 ms simulates a Worker crash by suppressing
-  heartbeats for six seconds. Temporal's five-second heartbeat timeout retries
-  the Activity while the original badge is still unavailable. The badge
+  heartbeats for 16 seconds. Temporal's 15-second heartbeat timeout retries the
+  Activity while the original badge is still unavailable. The badge
   refuses that question for the rest of the game, allowing another Worker to
   recover it. Panic itself scores `0`.
 - The controller counts active ESP32 Activity pollers when a round starts. The
-  Workflow keeps one outstanding Activity per registered participant, minus
-  one global recovery reserve, with a minimum of one Activity. Phone joins
-  grow that target during the round. Retrying unfinished work is not a
-  duplicate. The API may override the target for diagnostics.
+  Workflow keeps one outstanding Activity per registered participant, with a
+  minimum of one bootstrap Activity for a phone-only round. Phone joins grow
+  that target during the round. Retrying unfinished work is not a duplicate;
+  it may wait briefly for a Worker rather than leaving a healthy participant
+  idle throughout normal play. The API may override the target for diagnostics.
 - Phones do not impersonate SDK Workers. A Rust Temporal Worker on a GCP Cloud
   Run Worker Pool receives real Activities, assigns them durably through the
   Game Workflow, and returns `WillCompleteAsync`. The stateless phone API

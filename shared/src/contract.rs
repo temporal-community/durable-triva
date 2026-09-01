@@ -313,14 +313,16 @@ impl GameSnapshot {
 
     /// How many Activities the Workflow keeps outstanding.
     ///
-    /// GAME_SPEC: reserve one participant to pick up heartbeat-timeout retries.
+    /// GAME_SPEC: keep one Activity outstanding per registered participant.
     /// Phone players join after the Workflow starts, so the durable counts are
     /// the fallback source of truth when the controller supplies no override.
+    /// Heartbeat retries may wait briefly for a Worker instead of leaving an
+    /// otherwise healthy player idle throughout normal play.
     pub fn target_backlog(&self, override_value: Option<usize>) -> usize {
         override_value.unwrap_or_else(|| {
             let participants =
                 self.detected_badge_count as usize + self.registered_phone_count as usize;
-            participants.saturating_sub(1).max(1)
+            participants.max(1)
         })
     }
 
@@ -377,13 +379,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn backlog_reserves_one_participant_for_retries() {
+    fn backlog_keeps_every_participant_playing() {
         let mut state = GameSnapshot::default();
         assert_eq!(state.target_backlog(None), 1);
         state.detected_badge_count = 10;
-        assert_eq!(state.target_backlog(None), 9);
+        assert_eq!(state.target_backlog(None), 10);
         state.registered_phone_count = 100;
-        assert_eq!(state.target_backlog(None), 109);
+        assert_eq!(state.target_backlog(None), 110);
         assert_eq!(
             state.target_backlog(Some(33)),
             33,

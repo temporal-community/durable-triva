@@ -74,8 +74,8 @@ const ACTIVE_WORKFLOW_ID: &str = "temporal-trivia-active";
 /// final standings before it gives up and shows RESULT PENDING.
 const RESULT_WATCH_INTERVAL: Duration = Duration::from_secs(1);
 const RESULT_WATCH_POLLS: u32 = 45;
-/// Keep final standings readable, then make an idle recovery reserve visibly
-/// ready for the next round instead of leaving stale results on screen.
+/// Keep final standings readable, then make an idle badge visibly ready for
+/// the next round instead of leaving stale results on screen.
 const RESULT_HOLD: Duration = Duration::from_secs(5);
 
 type SharedDisplay = Arc<Mutex<BadgeDisplay>>;
