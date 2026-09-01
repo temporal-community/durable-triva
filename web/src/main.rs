@@ -2,16 +2,20 @@ mod model;
 mod questions;
 mod workflow;
 
+use temporal_trivia_web::cloud;
+
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     convert::Infallible,
-    path::{Path, PathBuf},
-    str::FromStr,
-    sync::Arc,
+    future::Future,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow};
 use axum::{
     Json, Router,
     extract::{Path as AxumPath, State},
@@ -24,9 +28,9 @@ use qrcode::{QrCode, render::svg};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use temporalio_client::{
-    Client, ClientOptions, Connection, ConnectionOptions, NamespacedClient, TlsOptions,
-    WorkflowDescribeOptions, WorkflowExecuteUpdateOptions, WorkflowExecution, WorkflowHandle,
-    WorkflowListOptions, WorkflowQueryOptions, WorkflowStartOptions, tonic::Request,
+    Client, NamespacedClient, WorkflowDescribeOptions, WorkflowExecuteUpdateOptions,
+    WorkflowExecution, WorkflowHandle, WorkflowListOptions, WorkflowQueryOptions,
+    WorkflowStartOptions, tonic::Request,
 };
 use temporalio_common::protos::temporal::api::enums::v1::{
     TaskQueueType, WorkflowIdConflictPolicy, WorkflowIdReusePolicy,
@@ -36,7 +40,6 @@ use temporalio_common::protos::temporal::api::{
 };
 use temporalio_common::telemetry::TelemetryOptions;
 use temporalio_sdk::{Runtime, Worker, WorkerOptions, runtime::RuntimeOptions};
-use temporalio_sdk_core::Url;
 use tokio::sync::{Mutex, RwLock, broadcast};
 use tokio_stream::wrappers::BroadcastStream;
 use uuid::Uuid;
@@ -44,7 +47,7 @@ use uuid::Uuid;
 use crate::{
     model::{
         BADGE_TASK_QUEUE, ChaosCommand, GAME_SECONDS, GameInput, GameSnapshot, GameStatus,
-        RoundMemo, WEB_TASK_QUEUE,
+        RoundMemo, WEB_TASK_QUEUE, is_badge_worker_identity,
     },
     workflow::{GameWorkflow, GameWorkflowRun},
 };
@@ -66,6 +69,14 @@ const WORKFLOW_MAX_ERROR_BACKOFF: Duration = Duration::from_secs(4);
 const MAX_BACKLOG_OVERRIDE: usize = 100;
 const ROUND_HISTORY_LIMIT: usize = 12;
 const ROUND_HISTORY_SCAN_LIMIT: usize = 100;
+/// Questions dealt to a round.
+///
+/// The whole deck travels in `GameInput` and lands in
+/// `WorkflowExecutionStarted`, where it stays for the life of the execution.
+/// Ten badges over the 90 second ceiling get through roughly 200 -- a badge
+/// needs a few seconds to read and press -- so 500 put about 70 KB of undealt
+/// questions into every History.
+const DECK_SIZE: usize = 150;
 const ACTIVE_BADGE_POLLER_MAX_AGE: Duration = Duration::from_secs(60);
 
 #[derive(Clone)]
@@ -76,6 +87,12 @@ struct AppState {
     events: broadcast::Sender<String>,
     instance_id: String,
     restored_snapshot_digest: Arc<RwLock<String>>,
+    /// Whether a Workflow Query to Temporal has actually succeeded.
+    ///
+    /// The recovery proof is the page that claims this process rebuilt its
+    /// state from Temporal rather than from memory, so reporting a literal
+    /// `true` made the one claim worth checking unfalsifiable.
+    temporal_query_succeeded: Arc<AtomicBool>,
 }
 
 #[derive(Default, Deserialize)]
@@ -157,6 +174,7 @@ async fn main() -> Result<()> {
         events,
         instance_id: Uuid::new_v4().to_string(),
         restored_snapshot_digest: Arc::new(RwLock::new(String::new())),
+        temporal_query_succeeded: Arc::new(AtomicBool::new(false)),
     };
     let server = async move {
         // Poll the Workflow concurrently with `worker.run()`, but do not
@@ -263,7 +281,7 @@ async fn recovery_proof(State(state): State<AppState>) -> Json<RecoveryProof> {
     Json(RecoveryProof {
         process_id: std::process::id(),
         instance_id: state.instance_id.clone(),
-        temporal_query_succeeded: true,
+        temporal_query_succeeded: state.temporal_query_succeeded.load(Ordering::Acquire),
         restored_snapshot_digest: state.restored_snapshot_digest.read().await.clone(),
         snapshot_digest: snapshot_digest(&snapshot),
         snapshot,
@@ -330,7 +348,7 @@ async fn start_game(
     let detected_badge_count = active_badge_count(&state.client)
         .await
         .map_err(|error| ApiError(StatusCode::BAD_GATEWAY, error.to_string()))?;
-    let deck = questions::build_deck(rand::random(), 500)
+    let deck = questions::build_deck(rand::random(), DECK_SIZE)
         .map_err(|error| ApiError(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let game_id = format!("trivia-{}", Uuid::new_v4().simple());
     {
@@ -422,10 +440,6 @@ async fn active_badge_count(client: &Client) -> Result<usize> {
         .map(|poller| poller.identity)
         .collect::<HashSet<_>>()
         .len())
-}
-
-fn is_badge_worker_identity(identity: &str) -> bool {
-    identity.starts_with("badge/") || identity.starts_with("esp32-")
 }
 
 /// Update rejections come back as `Update failed:` and mean the Workflow's
@@ -522,7 +536,7 @@ async fn crash_worker() -> Result<Json<serde_json::Value>, ApiError> {
 
 async fn round_history(State(state): State<AppState>) -> Result<Json<Vec<RoundSummary>>, ApiError> {
     let stream = state.client.list_workflows(
-        "WorkflowId = 'temporal-trivia-active' AND ExecutionStatus = 'Completed'",
+        format!("WorkflowId = '{ACTIVE_WORKFLOW_ID}' AND ExecutionStatus = 'Completed'"),
         WorkflowListOptions::builder()
             .limit(ROUND_HISTORY_SCAN_LIMIT)
             .build(),
@@ -564,13 +578,64 @@ fn system_time_unix_ms(time: SystemTime) -> u64 {
         .as_millis() as u64
 }
 
+/// The Workflow Query the recovery proof rests on.
+///
+/// A trait so the health flag's transitions can be exercised without a live
+/// `Client`: the real implementation talks to Temporal, and the tests hand in
+/// a source that answers or refuses on demand.
+trait SnapshotQuery {
+    fn snapshot(&self) -> impl Future<Output = Result<GameSnapshot>> + Send;
+}
+
+impl SnapshotQuery for WorkflowHandle<Client, GameWorkflowRun> {
+    async fn snapshot(&self) -> Result<GameSnapshot> {
+        self.query(GameWorkflow::snapshot, (), WorkflowQueryOptions::default())
+            .await
+            .map_err(|error| anyhow!("query Workflow snapshot: {error}"))
+    }
+}
+
+/// What a failed Query means for the claim that Temporal answered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OnQueryFailure {
+    /// Startup: a failure means this process did *not* rebuild from Temporal,
+    /// so the recovery proof must stop claiming it did.
+    Retract,
+    /// Steady state: a transient poll failure does not undo a rebuild that
+    /// already happened.
+    Keep,
+}
+
+/// Runs the Query and records whether Temporal actually answered.
+async fn query_recording_health<Q: SnapshotQuery>(
+    query: &Q,
+    health: &AtomicBool,
+    on_failure: OnQueryFailure,
+) -> Result<GameSnapshot> {
+    match query.snapshot().await {
+        Ok(snapshot) => {
+            health.store(true, Ordering::Release);
+            Ok(snapshot)
+        }
+        Err(error) => {
+            if on_failure == OnQueryFailure::Retract {
+                health.store(false, Ordering::Release);
+            }
+            Err(error)
+        }
+    }
+}
+
 async fn resume_active_game(state: AppState) {
     let handle = state
         .client
         .get_workflow_handle::<GameWorkflowRun>(ACTIVE_WORKFLOW_ID);
-    let Ok(snapshot) = handle
-        .query(GameWorkflow::snapshot, (), WorkflowQueryOptions::default())
-        .await
+    let Ok(snapshot) = query_recording_health(
+        &handle,
+        &state.temporal_query_succeeded,
+        OnQueryFailure::Retract,
+    )
+    .await
     else {
         let snapshot = state.snapshot.read().await;
         let digest = snapshot_digest(&snapshot);
@@ -601,9 +666,12 @@ async fn observe_workflow(
         if state.active_workflow.lock().await.as_deref() != Some(&game_id) {
             return;
         }
-        match handle
-            .query(GameWorkflow::snapshot, (), WorkflowQueryOptions::default())
-            .await
+        match query_recording_health(
+            &handle,
+            &state.temporal_query_succeeded,
+            OnQueryFailure::Keep,
+        )
+        .await
         {
             Ok(snapshot) => {
                 consecutive_errors = 0;
@@ -651,75 +719,116 @@ async fn publish(state: &AppState, snapshot: GameSnapshot) {
 }
 
 async fn connect_cloud() -> Result<Client> {
-    let settings = read_cloud_settings()?;
-    let address = required(&settings, "TEMPORAL_ADDRESS")?;
-    let target = if address.contains("://") {
-        address.to_owned()
-    } else {
-        format!("https://{address}")
-    };
-    let options = ConnectionOptions::new(Url::from_str(&target)?)
-        .api_key(required(&settings, "TEMPORAL_API_KEY")?)
-        .tls_options(TlsOptions::default())
-        .build();
-    let connection = Connection::connect(options).await?;
-    Client::new(
-        connection,
-        ClientOptions::new(required(&settings, "TEMPORAL_NAMESPACE")?).build(),
-    )
-    .map_err(Into::into)
-}
-
-fn read_cloud_settings() -> Result<HashMap<String, String>> {
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let project = manifest.parent().context("locate repository root")?;
-    let repo_env = project.join(".env");
-    let local_path = if repo_env.is_file() {
-        repo_env
-    } else {
-        project.join(".env.temporal")
-    };
-    let legacy_path = project
-        .parent()
-        .and_then(Path::parent)
-        .map(|root| root.join("TrafficLight/.env"));
-    let path = std::env::var_os("TEMPORAL_ENV_FILE")
-        .map(PathBuf::from)
-        .or_else(|| local_path.is_file().then_some(local_path.clone()))
-        .unwrap_or_else(|| legacy_path.unwrap_or(local_path));
-    let mut settings = if path.is_file() {
-        parse_env_file(&path)?
-    } else {
-        HashMap::new()
-    };
-    for key in ["TEMPORAL_ADDRESS", "TEMPORAL_NAMESPACE", "TEMPORAL_API_KEY"] {
-        if let Ok(value) = std::env::var(key)
-            && !value.is_empty()
-        {
-            settings.insert(key.to_owned(), value);
-        }
-    }
-    Ok(settings)
-}
-
-fn parse_env_file(path: &Path) -> Result<HashMap<String, String>> {
-    let content = std::fs::read_to_string(path)
-        .with_context(|| format!("read Temporal settings from {}", path.display()))?;
-    temporal_trivia_shared::parse_env(&content)
-        .with_context(|| format!("parse Temporal settings from {}", path.display()))
-}
-
-fn required<'a>(settings: &'a HashMap<String, String>, name: &str) -> Result<&'a str> {
-    let value = settings.get(name).map(String::as_str).unwrap_or("");
-    if value.is_empty() {
-        bail!("missing {name}; set it in the environment or .env.temporal");
-    }
-    Ok(value)
+    let profile = cloud::load_profile()?;
+    cloud::connect(&profile).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `SnapshotQuery` that answers or refuses on command, so the health
+    /// flag can be driven through every transition without a live `Client`.
+    struct FakeQuery {
+        answers: std::sync::Mutex<Vec<bool>>,
+    }
+
+    impl FakeQuery {
+        fn new(answers: [bool; 3]) -> Self {
+            let mut answers = answers.to_vec();
+            answers.reverse();
+            Self {
+                answers: std::sync::Mutex::new(answers),
+            }
+        }
+    }
+
+    impl SnapshotQuery for FakeQuery {
+        async fn snapshot(&self) -> Result<GameSnapshot> {
+            if self.answers.lock().expect("fake lock").pop() == Some(true) {
+                Ok(GameSnapshot::default())
+            } else {
+                Err(anyhow!("Temporal did not answer"))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_query_at_startup_retracts_the_recovery_claim() {
+        let health = AtomicBool::new(false);
+        let query = FakeQuery::new([true, false, true]);
+
+        // A first answer earns the claim.
+        assert!(
+            query_recording_health(&query, &health, OnQueryFailure::Retract)
+                .await
+                .is_ok()
+        );
+        assert!(health.load(Ordering::Acquire));
+
+        // A failure on the startup path takes it back: this process did not
+        // rebuild from Temporal, whatever its in-memory snapshot says.
+        assert!(
+            query_recording_health(&query, &health, OnQueryFailure::Retract)
+                .await
+                .is_err()
+        );
+        assert!(
+            !health.load(Ordering::Acquire),
+            "a failed resume must not keep claiming Temporal answered"
+        );
+
+        // And it can be earned back.
+        assert!(
+            query_recording_health(&query, &health, OnQueryFailure::Retract)
+                .await
+                .is_ok()
+        );
+        assert!(health.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn a_transient_poll_failure_does_not_retract_a_rebuild() {
+        let health = AtomicBool::new(false);
+        let query = FakeQuery::new([true, false, false]);
+
+        assert!(
+            query_recording_health(&query, &health, OnQueryFailure::Keep)
+                .await
+                .is_ok()
+        );
+        assert!(health.load(Ordering::Acquire));
+
+        for _ in 0..2 {
+            assert!(
+                query_recording_health(&query, &health, OnQueryFailure::Keep)
+                    .await
+                    .is_err()
+            );
+            assert!(
+                health.load(Ordering::Acquire),
+                "the rebuild already happened; a dropped poll does not undo it"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_recovery_claim_starts_false() {
+        // The bug this replaced was a literal `true` in the response body, so
+        // the untouched default is the case worth pinning.
+        let health = AtomicBool::new(false);
+        assert!(!health.load(Ordering::Acquire));
+        let query = FakeQuery::new([false, false, false]);
+        assert!(
+            query_recording_health(&query, &health, OnQueryFailure::Keep)
+                .await
+                .is_err()
+        );
+        assert!(
+            !health.load(Ordering::Acquire),
+            "never answered, never claims it did"
+        );
+    }
 
     #[test]
     fn observer_backoff_is_bounded() {
@@ -741,10 +850,17 @@ mod tests {
         );
     }
 
+    use temporal_trivia_shared::identity_from_mac;
+
     #[test]
     fn badge_worker_identity_accepts_named_and_legacy_badges_only() {
+        // The prefixes now come from shared::identity alongside the firmware
+        // code that produces them; this keeps the controller's own use of the
+        // predicate covered from here.
         assert!(is_badge_worker_identity("badge/KEEN-RAVEN-C8"));
-        assert!(is_badge_worker_identity("esp32-e83dc1f94bc8"));
+        assert!(is_badge_worker_identity(
+            &identity_from_mac([0xe8, 0x3d, 0xc1, 0xf9, 0x4b, 0xc8]).id
+        ));
         assert!(!is_badge_worker_identity("63305@Fatehowler.local"));
     }
 }

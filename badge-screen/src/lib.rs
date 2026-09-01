@@ -4,10 +4,15 @@
 //! I2C transport and nothing else, so every screen the badge can draw is unit
 //! testable and previewable from a development host.
 
+use std::fmt;
+
 use temporal_trivia_shared::{ChaosCommand, GameSnapshot, Question};
 
+/// Panel width in pixels. The SSD1306 the badge carries is 128x64.
 pub const WIDTH: usize = 128;
+/// Panel height in pixels.
 pub const HEIGHT: usize = 64;
+/// Framebuffer size in bytes: one bit per pixel, eight rows to a page.
 pub const BUFFER_LEN: usize = WIDTH * HEIGHT / 8;
 
 /// Full-size glyphs are 5x7 drawn on a 6px pitch.
@@ -38,10 +43,74 @@ const ANSWER_LABEL_LINES: usize = 2;
 const PROMPT_CHARS: usize = 31;
 const PROMPT_LINES: usize = 3;
 
+/// A boot-sequence screen.
+///
+/// Headline and instruction travel together: they used to be a `&str` headline
+/// and a `match` on its text, so a typo silently fell through to "PLEASE WAIT"
+/// instead of failing to compile.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Status {
+    Booting,
+    ConnectingWifi,
+    SyncingTime,
+    ConnectingCloud,
+    ResultPending,
+}
+
+impl Status {
+    /// Every variant, in the order the badge reaches them. `preview` renders
+    /// this, so a new variant cannot be added without a picture of it.
+    pub const ALL: [Self; 5] = [
+        Self::Booting,
+        Self::ConnectingWifi,
+        Self::SyncingTime,
+        Self::ConnectingCloud,
+        Self::ResultPending,
+    ];
+
+    #[must_use]
+    pub const fn headline(self) -> &'static str {
+        match self {
+            Self::Booting => "BOOTING",
+            Self::ConnectingWifi => "CONNECTING WIFI",
+            Self::SyncingTime => "SYNCING TIME",
+            Self::ConnectingCloud => "CONNECTING CLOUD",
+            Self::ResultPending => "RESULT PENDING",
+        }
+    }
+
+    #[must_use]
+    pub const fn instruction(self) -> &'static str {
+        match self {
+            Self::Booting => "STARTING RUST WORKER",
+            Self::ConnectingWifi => "JOINING BADGE NETWORK",
+            Self::SyncingTime => "PREPARING CLOUD TLS",
+            Self::ConnectingCloud => "CONNECTING TEMPORAL",
+            Self::ResultPending => "TEMPORAL HAS THE RESULT",
+        }
+    }
+}
+
 /// A 1-bit 128x64 framebuffer laid out the way the SSD1306 expects it.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Canvas {
     buffer: [u8; BUFFER_LEN],
+}
+
+/// Reports the shape and how much of it is lit, not the buffer.
+///
+/// A derived `Debug` would print all 1024 bytes into every failing
+/// `assert_eq!`, which buries the assertion that failed.
+impl fmt::Debug for Canvas {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let lit: u32 = self.buffer.iter().map(|byte| byte.count_ones()).sum();
+        formatter
+            .debug_struct("Canvas")
+            .field("width", &WIDTH)
+            .field("height", &HEIGHT)
+            .field("lit_pixels", &lit)
+            .finish()
+    }
 }
 
 impl Default for Canvas {
@@ -58,14 +127,19 @@ impl Canvas {
     }
 
     /// Raw framebuffer, ready to be pushed to the panel.
+    /// The raw framebuffer, ready to hand to the SSD1306 unaltered.
     pub fn bits(&self) -> &[u8; BUFFER_LEN] {
         &self.buffer
     }
 
+    /// Blanks every pixel. Each screen method calls this first, so callers
+    /// only need it when composing a frame by hand.
     pub fn clear(&mut self) {
         self.buffer.fill(0);
     }
 
+    /// Whether one pixel is lit. Out-of-range coordinates read as unlit
+    /// rather than panicking, which keeps assertions in tests total.
     pub fn is_lit(&self, x: usize, y: usize) -> bool {
         if x >= WIDTH || y >= HEIGHT {
             return false;
@@ -81,18 +155,12 @@ impl Canvas {
 
     // ---------- screens ----------
 
-    pub fn status(&mut self, callsign: &str, headline: &str, subline: &str) {
-        let instruction = match headline {
-            "BOOTING" => "STARTING RUST WORKER",
-            "CONNECTING WIFI" => "JOINING BADGE NETWORK",
-            "SYNCING TIME" => "PREPARING CLOUD TLS",
-            "CONNECTING CLOUD" => "CONNECTING TEMPORAL",
-            "RESULT PENDING" => "TEMPORAL HAS THE RESULT",
-            _ => "PLEASE WAIT",
-        };
-        self.centered(callsign, headline, subline, &[instruction]);
+    /// A boot-sequence screen: headline plus its fixed instruction line.
+    pub fn status(&mut self, callsign: &str, status: Status) {
+        self.centered(callsign, status.headline(), "", &[status.instruction()]);
     }
 
+    /// The idle screen shown while this badge's Worker has no Activity.
     pub fn waiting(&mut self, callsign: &str) {
         self.centered(
             callsign,
@@ -106,6 +174,8 @@ impl Canvas {
         );
     }
 
+    /// The overlay announcing an operator power-up that landed as a
+    /// validated Workflow Update.
     pub fn powerup(&mut self, callsign: &str, command: ChaosCommand) {
         let (headline, detail, instruction) = match command {
             ChaosCommand::DoublePoints => ("DOUBLE POINTS", "SCORES X2", "TEMPORAL UPDATE APPLIED"),
@@ -120,6 +190,7 @@ impl Canvas {
         self.centered(callsign, headline, detail, &[instruction]);
     }
 
+    /// Counts the badge down to deep sleep.
     pub fn sleep_countdown(&mut self, callsign: &str, seconds: u64) {
         self.centered(
             callsign,
@@ -129,6 +200,8 @@ impl Canvas {
         );
     }
 
+    /// The last frame drawn before deep sleep; it stays on the panel
+    /// because the SSD1306 holds its contents without a Worker.
     pub fn sleeping(&mut self, callsign: &str) {
         self.centered(
             callsign,
@@ -138,6 +211,7 @@ impl Canvas {
         );
     }
 
+    /// A question with its four answers on the button positions.
     pub fn question(&mut self, callsign: &str, question: &Question) {
         self.clear();
         self.header(callsign);
@@ -152,6 +226,8 @@ impl Canvas {
 
     /// `score_delta` is the value Temporal will actually record, so a badge
     /// under double points agrees with the board instead of always claiming 1.
+    /// The verdict screen. `score_delta` is what Temporal will record,
+    /// already signed and already doubled if double points was in force.
     pub fn feedback(&mut self, callsign: &str, correct: bool, score_delta: i32) {
         let score = format!("SCORE {score_delta:+}");
         self.centered(
@@ -173,6 +249,8 @@ impl Canvas {
         );
     }
 
+    /// The simulated-crash screen, shown while the badge withholds
+    /// heartbeats so Temporal reassigns its question.
     pub fn panic(&mut self, callsign: &str) {
         self.centered(
             callsign,
@@ -182,6 +260,7 @@ impl Canvas {
         );
     }
 
+    /// Shown once the heartbeat blackout ends and the question has moved on.
     pub fn recovered(&mut self, callsign: &str) {
         self.centered(
             callsign,
@@ -191,6 +270,7 @@ impl Canvas {
         );
     }
 
+    /// Final standings, with this badge's own row called out.
     pub fn results(&mut self, callsign: &str, badge_id: &str, snapshot: &GameSnapshot) {
         let own = snapshot.players.get(badge_id);
         let own_score = own.map(|player| player.score).unwrap_or(0);
@@ -465,6 +545,10 @@ fn fold(character: char) -> char {
 
 /// True when the font has a real glyph for this character rather than falling
 /// back. Used by the deck test so unrenderable questions cannot ship.
+/// Whether the compact face can draw this character.
+///
+/// `questions.rs` filters the deck through this, so a question that would
+/// render as blanks on the panel never reaches a badge.
 pub fn is_renderable(character: char) -> bool {
     let folded = fold(character);
     folded.is_ascii_alphanumeric() || KNOWN_PUNCTUATION.contains(folded)
@@ -821,6 +905,36 @@ mod tests {
         for line in &lines {
             assert!(line.chars().count() <= 11, "{line:?} is too wide");
         }
+    }
+
+    #[test]
+    fn every_status_screen_draws_and_fits_the_panel() {
+        for status in Status::ALL {
+            let mut canvas = Canvas::new();
+            canvas.status("KEEN-RAVEN-C8", status);
+            assert!(lit(&canvas) > 0, "{:?} drew an empty panel", status);
+            assert!(
+                status.instruction().chars().count() <= MAX_COMPACT_CHARS,
+                "{:?} instruction is {} chars, panel fits {MAX_COMPACT_CHARS}",
+                status,
+                status.instruction().chars().count()
+            );
+        }
+    }
+
+    #[test]
+    fn status_headlines_are_distinct() {
+        // ALL is what preview renders; a duplicated headline would silently
+        // drop a screen from the contact sheet.
+        let mut seen = std::collections::BTreeSet::new();
+        for status in Status::ALL {
+            assert!(
+                seen.insert(status.headline()),
+                "duplicate headline {:?}",
+                status.headline()
+            );
+        }
+        assert_eq!(seen.len(), Status::ALL.len());
     }
 
     #[test]

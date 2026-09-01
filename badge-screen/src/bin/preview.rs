@@ -6,8 +6,10 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
-use badge_screen::{Canvas, HEIGHT, WIDTH};
-use temporal_trivia_shared::{ChaosCommand, GameSnapshot, GameStatus, PlayerScore, Question};
+use badge_screen::{Canvas, HEIGHT, Status, WIDTH};
+use temporal_trivia_shared::{
+    ChaosCommand, GameSnapshot, GameStatus, PlayerKind, PlayerScore, Question,
+};
 
 const SCALE: usize = 3;
 const CALLSIGN: &str = "KEEN-RAVEN-C8";
@@ -41,6 +43,7 @@ fn snapshot(winners: &[&str]) -> GameSnapshot {
             PlayerScore {
                 badge_id: format!("badge-{index}"),
                 callsign: (*callsign).to_owned(),
+                kind: PlayerKind::Badge,
                 score: 36 - (index as i32) * 4,
                 correct: 48 - (index as u32) * 5,
                 wrong: 12,
@@ -65,16 +68,13 @@ fn screens() -> Vec<(String, Canvas)> {
         out.push((label.to_owned(), canvas));
     };
 
-    for headline in [
-        "BOOTING",
-        "CONNECTING WIFI",
-        "SYNCING TIME",
-        "CONNECTING CLOUD",
-        "RESULT PENDING",
-    ] {
-        push(&format!("status: {headline}"), &|canvas: &mut Canvas| {
-            canvas.status(CALLSIGN, headline, "");
-        });
+    for status in Status::ALL {
+        push(
+            &format!("status: {}", status.headline()),
+            &|canvas: &mut Canvas| {
+                canvas.status(CALLSIGN, status);
+            },
+        );
     }
     push("waiting (idle worker)", &|canvas| canvas.waiting(CALLSIGN));
     push("question", &|canvas| canvas.question(CALLSIGN, &question()));
@@ -154,11 +154,12 @@ border:1px solid #1d2a24;border-radius:3px}\
 </style>",
     );
     for (label, canvas) in screens() {
-        let _ = write!(
+        write!(
             html,
             "<figure><figcaption>{label}</figcaption>{}</figure>",
             render(&canvas)
-        );
+        )
+        .expect("writing to a String cannot fail");
     }
     println!("{html}");
 }

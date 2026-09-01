@@ -46,26 +46,19 @@ fn main() {
     let project = firmware
         .parent()
         .expect("firmware is inside the repository");
-    let legacy_temporal = project
-        .parent()
-        .and_then(Path::parent)
-        .map(|root| root.join("TrafficLight/.env"))
-        .unwrap_or_else(|| project.join(".env.temporal"));
     let wifi_path = config_path(
         "BADGE_WIFI_ENV_FILE",
         firmware.join(".env.wifi"),
         firmware.join(".env.wifi"),
     );
-    let repo_env = project.join(".env");
-    let temporal_path = if repo_env.is_file() {
-        config_path("TEMPORAL_ENV_FILE", repo_env, legacy_temporal)
-    } else {
-        config_path(
-            "TEMPORAL_ENV_FILE",
-            project.join(".env.temporal"),
-            legacy_temporal,
-        )
-    };
+    // The repo's own .env, else .env.temporal. There is deliberately no
+    // fallback outside the repository: an absolute path belongs in
+    // TEMPORAL_ENV_FILE, which config_path asserts actually exists.
+    let temporal_path = config_path(
+        "TEMPORAL_ENV_FILE",
+        project.join(".env"),
+        project.join(".env.temporal"),
+    );
     println!("cargo:rerun-if-changed={}", wifi_path.display());
     println!("cargo:rerun-if-changed={}", temporal_path.display());
 

@@ -71,6 +71,27 @@ To use physical hardware, continue with the
 [badge firmware guide](firmware/README.md). To let the audience play from their
 phones, follow [Phone players](web/README.md#phone-players).
 
+## Common checks
+
+Run the host-side checks -- fmt, clippy and the full test suite for `web`,
+`shared`, `badge-screen` and `badge-input` -- from the repository root:
+
+```sh
+./check-host.sh
+git diff --check
+```
+
+**Use the script rather than a bare `cargo test`.** `.cargo/config.toml` pins
+`build.target` to `xtensa-esp32s3-espidf` so the firmware builds without extra
+flags, which means a plain `cargo test` or `cargo clippy` from the root tries
+to build the host crates for the badge and fails. `check-host.sh` supplies the
+host target and the stable toolchain explicitly. Extra arguments are passed
+through to `cargo test`, so `./check-host.sh winner` filters as usual.
+
+Firmware build and hardware verification live in `./build-firmware.sh`.
+Component-specific commands are in the [firmware guide](firmware/README.md)
+and [web guide](web/README.md).
+
 ## Documentation
 
 | Guide | Covers |
@@ -90,6 +111,7 @@ phones, follow [Phone players](web/README.md#phone-players).
 - `shared/` — serialized game contract shared by every Worker.
 - `badge-screen/` — hardware-independent 128×64 badge screen renderer and
   previews.
+- `badge-input/` — hardware-independent button gesture state machine.
 
 Both the controller and firmware use Temporal Rust SDK `0.7.0`. See the
 component guides for build and test commands.

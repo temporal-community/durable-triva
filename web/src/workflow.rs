@@ -41,6 +41,13 @@ pub struct GameWorkflow {
     attempts_seen: BTreeSet<String>,
     questions: BTreeMap<String, Question>,
     index_search_attributes: bool,
+    /// Workflow time as of the last `expire_chaos` sweep.
+    ///
+    /// `WorkflowContextView` deliberately exposes no clock — an Update
+    /// validator has to be a pure function of state and input — so this is
+    /// the freshest time `validate_apply_chaos` can reason about. Derived
+    /// from the run loop's deterministic `workflow_time`, so it replays.
+    last_chaos_sweep_unix_ms: u64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -128,7 +135,10 @@ impl GameWorkflow {
 
         loop {
             let now_unix_ms = workflow_unix_ms(ctx);
-            ctx.state_mut(|state| expire_chaos(&mut state.snapshot, now_unix_ms));
+            ctx.state_mut(|state| {
+                expire_chaos(&mut state.snapshot, now_unix_ms);
+                state.last_chaos_sweep_unix_ms = now_unix_ms;
+            });
             let deadline_unix_ms = ctx
                 .state(|state| state.snapshot.deadline_unix_ms)
                 .unwrap_or(now_unix_ms);
@@ -265,11 +275,20 @@ impl GameWorkflow {
         drop(pending);
         ctx.state_mut(|state| state.snapshot.finish());
         let round_memo = ctx.state(|state| RoundMemo::from(&state.snapshot));
-        ctx.upsert_memo([(
+        // A memo is a reporting convenience. Panicking here fails the Workflow
+        // Task, which Temporal then retries forever on a round that has already
+        // played out -- losing the result to protect a summary field.
+        if let Err(error) = ctx.upsert_memo([(
             "TriviaRoundSummary".to_owned(),
             Some(MemoValue::new(round_memo)),
-        )])
-        .expect("round summary memo update");
+        )]) {
+            ctx.state_mut(|state| {
+                state.snapshot.push_kind(
+                    EventKind::Fault,
+                    format!("Round summary memo was not recorded: {error}"),
+                );
+            });
+        }
         if input.index_search_attributes {
             upsert_finished_search_attributes(ctx);
         }
@@ -278,8 +297,9 @@ impl GameWorkflow {
 
     #[signal]
     pub fn badge_started(&mut self, ctx: &mut SyncWorkflowContext<Self>, event: BadgeEvent) {
-        self.record_activity_started(event.clone());
-        if !self.snapshot.players.contains_key(&event.badge_id) {
+        let reassigned = self.record_activity_started(event.clone());
+        let joined = !self.snapshot.players.contains_key(&event.badge_id);
+        if joined {
             self.snapshot.players.insert(
                 event.badge_id.clone(),
                 PlayerScore {
@@ -291,7 +311,7 @@ impl GameWorkflow {
             self.snapshot
                 .push_event(format!("{} joined", event.callsign));
         }
-        if self.index_search_attributes {
+        if should_upsert_running_attributes(self.index_search_attributes, joined, reassigned) {
             ctx.upsert_search_attributes([
                 SearchAttributeKey::int("TriviaBadgeCount")
                     .value_set(self.snapshot.players.len() as i64),
@@ -454,7 +474,7 @@ impl GameWorkflow {
                 Ok(())
             };
         }
-        if let Some(active) = active_modifier(&self.snapshot) {
+        if let Some(active) = active_modifier(&self.snapshot, self.last_chaos_sweep_unix_ms) {
             return Err(
                 format!("{active} is already active; gameplay modifiers cannot overlap").into(),
             );
@@ -622,7 +642,8 @@ impl GameWorkflow {
         }
     }
 
-    fn record_activity_started(&mut self, event: BadgeEvent) {
+    fn record_activity_started(&mut self, event: BadgeEvent) -> bool {
+        let mut reassigned = false;
         if let Some(previous) = self.assignments.get(&event.question_id)
             && is_reassignment(previous, &event)
         {
@@ -637,6 +658,7 @@ impl GameWorkflow {
                 reason,
                 attempt: event.attempt,
             };
+            reassigned = true;
             self.snapshot.reassignments += 1;
             self.snapshot.heartbeat_timeouts += 1;
             self.snapshot.latest_reassignment = Some(reassignment.clone());
@@ -660,6 +682,7 @@ impl GameWorkflow {
         {
             self.snapshot.activity_attempts += 1;
         }
+        reassigned
     }
 }
 
@@ -670,7 +693,9 @@ fn record_answer(
     now_unix_ms: u64,
 ) -> bool {
     ctx.state_mut(|state| {
-        if answer.question_id != question.id || answer.selected_index > 3 {
+        if answer.question_id != question.id
+            || usize::from(answer.selected_index) >= question.answers.len()
+        {
             state.snapshot.push_kind(
                 EventKind::Fault,
                 format!("Rejected malformed answer from {}", answer.callsign),
@@ -709,7 +734,14 @@ fn record_answer(
         state.snapshot.completed_questions += 1;
         state.snapshot.latest_answer = Some(AnswerSpotlight {
             question: question.prompt,
-            correct_answer: question.answers[question.correct_index as usize].clone(),
+            // correct_index is validated at the serde boundary, but this is
+            // the only place it indexes, and a panic here would fail the
+            // Workflow Task on a round that has already been answered.
+            correct_answer: question
+                .answers
+                .get(usize::from(question.correct_index))
+                .cloned()
+                .unwrap_or_default(),
             callsign: answer.callsign.clone(),
             was_correct,
             score,
@@ -789,14 +821,39 @@ fn player_rank(snapshot: &GameSnapshot, player_id: &str) -> Option<u32> {
     )
 }
 
+/// Whether a `badge_started` Signal actually changed either indexed value.
+///
+/// `TriviaBadgeCount` moves only when a badge joins and `TriviaReassignments`
+/// only on a handoff, but the Signal fires once per Activity attempt --
+/// roughly 245 times in a full round against about ten joins. Upserting
+/// regardless wrote the same numbers back ~225 times per round, each costing
+/// a History event and a visibility-store write.
+fn should_upsert_running_attributes(indexing: bool, joined: bool, reassigned: bool) -> bool {
+    indexing && (joined || reassigned)
+}
+
 fn is_reassignment(previous: &BadgeEvent, current: &BadgeEvent) -> bool {
     previous.badge_id != current.badge_id && current.attempt > previous.attempt
 }
 
-fn active_modifier(snapshot: &GameSnapshot) -> Option<&'static str> {
-    if snapshot.chaos.double_points_until_unix_ms.is_some() {
+/// The gameplay modifier in force at `now_unix_ms`, if any.
+///
+/// Takes the clock rather than trusting `expire_chaos` to have run. That
+/// sweep happens once per loop tick, so between a modifier expiring and the
+/// next tick the fields are still populated — and this is what
+/// `validate_apply_chaos` rejects an operator's powerup on.
+fn active_modifier(snapshot: &GameSnapshot, now_unix_ms: u64) -> Option<&'static str> {
+    if snapshot
+        .chaos
+        .double_points_until_unix_ms
+        .is_some_and(|until| until > now_unix_ms)
+    {
         Some("double points")
-    } else if snapshot.chaos.rust_only_until_unix_ms.is_some() {
+    } else if snapshot
+        .chaos
+        .rust_only_until_unix_ms
+        .is_some_and(|until| until > now_unix_ms)
+    {
         Some("Rust only")
     } else if snapshot.chaos.sudden_death {
         Some("sudden death")
@@ -961,11 +1018,11 @@ mod tests {
     fn gameplay_modifiers_are_mutually_exclusive_but_extension_is_independent() {
         let mut snapshot = GameSnapshot::default();
         snapshot.chaos.rust_only_until_unix_ms = Some(20_000);
-        assert_eq!(active_modifier(&snapshot), Some("Rust only"));
+        assert_eq!(active_modifier(&snapshot, 19_999), Some("Rust only"));
         expire_chaos(&mut snapshot, 20_000);
-        assert_eq!(active_modifier(&snapshot), None);
+        assert_eq!(active_modifier(&snapshot, 20_000), None);
         snapshot.chaos.extension_used = true;
-        assert_eq!(active_modifier(&snapshot), None);
+        assert_eq!(active_modifier(&snapshot, 20_000), None);
     }
 
     #[test]
@@ -990,5 +1047,122 @@ mod tests {
                 ..retry
             }
         ));
+    }
+
+    #[test]
+    fn an_expired_modifier_is_not_reported_as_active() {
+        // Review finding L2. `validate_apply_chaos` rejects a new powerup with
+        // "<X> is already active" whenever `active_modifier` returns Some, but
+        // `active_modifier` only tests `.is_some()` and never compares against
+        // the clock. `expire_chaos` clears the field once per loop tick, so for
+        // up to a second after a modifier expires the operator's next powerup
+        // is rejected by an Update validator citing a modifier that has ended.
+        let mut snapshot = GameSnapshot::default();
+        snapshot.chaos.double_points_until_unix_ms = Some(1_000);
+        let now_unix_ms = 5_000;
+
+        // The time-aware half of the pair has already stopped doubling.
+        assert_eq!(active_points(&snapshot, now_unix_ms), 1);
+
+        // So the validator must not still call the round modified.
+        assert_eq!(
+            active_modifier(&snapshot, now_unix_ms),
+            None,
+            "double points expired at 1000, it is now {now_unix_ms}"
+        );
+    }
+
+    #[test]
+    fn rust_only_scheduling_falls_back_when_the_rust_pool_is_empty() {
+        let mut available: VecDeque<Question> = [
+            question("general-1", "general"),
+            question("general-2", "general"),
+        ]
+        .into_iter()
+        .collect();
+        assert!(
+            take_next_question(&mut available, true).is_none(),
+            "rust-only must not silently deal a non-rust question"
+        );
+        assert_eq!(available.len(), 2, "a refused deal leaves the deck intact");
+        assert_eq!(
+            take_next_question(&mut available, false).map(|q| q.id),
+            Some("general-1".to_owned())
+        );
+    }
+
+    #[test]
+    fn expire_chaos_leaves_a_live_modifier_alone() {
+        let mut snapshot = GameSnapshot::default();
+        snapshot.chaos.double_points_until_unix_ms = Some(10_000);
+        snapshot.chaos.rust_only_until_unix_ms = Some(4_000);
+        expire_chaos(&mut snapshot, 4_000);
+        assert_eq!(
+            snapshot.chaos.double_points_until_unix_ms,
+            Some(10_000),
+            "still in the future"
+        );
+        assert_eq!(
+            snapshot.chaos.rust_only_until_unix_ms, None,
+            "expiry is inclusive of the boundary"
+        );
+    }
+
+    #[test]
+    fn an_out_of_range_answer_index_is_rejected_not_indexed() {
+        let question = question("q-1", "rust");
+        // The wire type validates this at the serde boundary, so an
+        // out-of-range index can only arrive from a replayed History or a
+        // hand-crafted payload -- exactly when a panic would be worst.
+        for index in [4_u8, 200, u8::MAX] {
+            assert!(
+                usize::from(index) >= question.answers.len(),
+                "index {index} must be treated as malformed"
+            );
+        }
+        assert!(usize::from(3_u8) < question.answers.len());
+    }
+
+    #[test]
+    fn running_attributes_are_upserted_only_when_a_value_changed() {
+        // The Signal fires once per Activity attempt; the indexed values move
+        // on a join or a handoff and nothing else.
+        assert!(should_upsert_running_attributes(true, true, false), "join");
+        assert!(
+            should_upsert_running_attributes(true, false, true),
+            "handoff"
+        );
+        assert!(
+            should_upsert_running_attributes(true, true, true),
+            "a joining badge picking up reassigned work"
+        );
+        assert!(
+            !should_upsert_running_attributes(true, false, false),
+            "a routine attempt by a known badge changes neither value"
+        );
+        assert!(
+            !should_upsert_running_attributes(false, true, true),
+            "indexing off suppresses the upsert regardless"
+        );
+    }
+
+    #[test]
+    fn a_retry_on_the_same_badge_is_not_a_reassignment() {
+        let previous = BadgeEvent {
+            badge_id: "badge-a".to_owned(),
+            callsign: "A".to_owned(),
+            question_id: "q".to_owned(),
+            attempt: 1,
+        };
+        assert!(
+            !is_reassignment(
+                &previous,
+                &BadgeEvent {
+                    attempt: 2,
+                    ..previous.clone()
+                }
+            ),
+            "same badge picking its own question back up is a retry, not a handoff"
+        );
     }
 }

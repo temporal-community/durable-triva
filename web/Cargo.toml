@@ -18,7 +18,7 @@ serde_json = "1"
 sha2 = "0.10"
 temporal-trivia-shared = { path = "../shared" }
 temporalio-client = { version = "=0.7.0", default-features = false }
-temporalio-common = { version = "=0.7.0", default-features = false }
+temporalio-common = { version = "=0.7.0", default-features = false, features = ["envconfig"] }
 temporalio-macros = "=0.7.0"
 temporalio-sdk = { version = "=0.7.0", default-features = false }
 temporalio-sdk-core = { version = "=0.7.0", default-features = false, features = ["tls-ring"] }

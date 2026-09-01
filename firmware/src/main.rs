@@ -44,6 +44,9 @@ use temporalio_sdk::{
 };
 use temporalio_sdk_core::{ActivitySlotKind, FixedSizeSlotSupplier, TunerBuilder, Url};
 
+use badge_input::{ButtonState, Choice, PANIC_HOLD};
+use badge_screen::Status;
+
 use crate::{
     display::BadgeDisplay,
     haptics::{BadgeHaptics, HapticEvent, SharedHaptics},
@@ -54,7 +57,6 @@ use crate::{
 };
 
 include!(concat!(env!("OUT_DIR"), "/firmware_config.rs"));
-const PANIC_HOLD: Duration = Duration::from_millis(500);
 const HEARTBEAT_BLACKOUT: Duration = Duration::from_secs(6);
 const WORKER_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 const MAX_ACTIVITY_RUNTIME: Duration = Duration::from_secs(120);
@@ -64,6 +66,10 @@ const POWERUP_FRESHNESS_MS: u64 = 5_000;
 const FEEDBACK_HOLD: Duration = Duration::from_millis(1_100);
 const GAME_SIGNAL_TIMEOUT: Duration = Duration::from_millis(750);
 const ACTIVE_WORKFLOW_ID: &str = "temporal-trivia-active";
+/// How long a badge waits past the deadline for the Workflow to publish the
+/// final standings before it gives up and shows RESULT PENDING.
+const RESULT_WATCH_INTERVAL: Duration = Duration::from_secs(1);
+const RESULT_WATCH_POLLS: u32 = 45;
 
 type SharedDisplay = Arc<Mutex<BadgeDisplay>>;
 type SharedInput = Arc<Mutex<BadgeInput>>;
@@ -168,11 +174,6 @@ impl Drop for PowerupActiveGuard {
     fn drop(&mut self) {
         self.0.store(false, Ordering::Release);
     }
-}
-
-enum Choice {
-    Answer(u8),
-    Panic,
 }
 
 #[activities]
@@ -337,11 +338,8 @@ impl BadgeActivities {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
 
-        let mut left_armed = false;
-        let mut right_armed = false;
-        let mut combo_started: Option<Instant> = None;
+        let mut state = ButtonState::default();
         let mut last_heartbeat = Instant::now();
-        let mut suppress_until_release = false;
         loop {
             if ctx.is_cancelled()
                 || unix_ms() >= deadline_unix_ms
@@ -355,50 +353,15 @@ impl BadgeActivities {
                 }
                 last_heartbeat = Instant::now();
             }
-            let buttons = self.sample_buttons()?;
-            if self.powerup_active.load(Ordering::Acquire) {
-                suppress_until_release = true;
-                left_armed = false;
-                right_armed = false;
-                combo_started = None;
-                tokio::time::sleep(Duration::from_millis(20)).await;
-                continue;
-            }
-            if suppress_until_release {
-                if !buttons.any() {
-                    suppress_until_release = false;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-                continue;
-            }
-            if buttons.left && buttons.right {
-                let started = combo_started.get_or_insert_with(Instant::now);
-                if started.elapsed() >= PANIC_HOLD {
-                    return Ok(Choice::Panic);
-                }
-                left_armed = true;
-                right_armed = true;
-            } else {
-                if combo_started.take().is_some() {
-                    left_armed = false;
-                    right_armed = false;
-                }
-                if buttons.up {
-                    return Ok(Choice::Answer(0));
-                }
-                if buttons.down {
-                    return Ok(Choice::Answer(3));
-                }
-                if buttons.left {
-                    left_armed = true;
-                } else if left_armed && !right_armed {
-                    return Ok(Choice::Answer(2));
-                }
-                if buttons.right {
-                    right_armed = true;
-                } else if right_armed && !left_armed {
-                    return Ok(Choice::Answer(1));
-                }
+            let (next, choice) = state.advance(
+                self.sample_buttons()?,
+                self.powerup_active.load(Ordering::Acquire),
+                Instant::now(),
+                PANIC_HOLD,
+            );
+            state = next;
+            if let Some(choice) = choice {
+                return Ok(choice);
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -424,10 +387,11 @@ impl BadgeActivities {
             .result_watcher
             .lock()
             .map_err(|_| anyhow!("watcher lock poisoned"))?;
-        if let Some(current) = watcher.as_ref() {
-            if current.game_id == task.game_id && !current.task.is_finished() {
-                return Ok(());
-            }
+        if let Some(current) = watcher.as_ref()
+            && current.game_id == task.game_id
+            && !current.task.is_finished()
+        {
+            return Ok(());
         }
         if let Some(previous) = watcher.take() {
             previous.task.abort();
@@ -440,19 +404,18 @@ impl BadgeActivities {
         let task = tokio::spawn(async move {
             let wait_ms = deadline_unix_ms.saturating_sub(unix_ms());
             tokio::time::sleep(Duration::from_millis(wait_ms)).await;
-            for _ in 0..45 {
+            for _ in 0..RESULT_WATCH_POLLS {
                 match handle
                     .query(GameWorkflow::snapshot, (), WorkflowQueryOptions::default())
                     .await
                 {
                     Ok(snapshot) if snapshot.status == model::GameStatus::Finished => {
                         let won = snapshot.winners.contains(&identity.callsign);
-                        if let Ok(mut screen) = display.lock() {
-                            if let Err(error) =
+                        if let Ok(mut screen) = display.lock()
+                            && let Err(error) =
                                 screen.show_results(&identity.callsign, &identity.id, &snapshot)
-                            {
-                                log::error!("show final results: {error:#}");
-                            }
+                        {
+                            log::error!("show final results: {error:#}");
                         }
                         haptics::play(
                             &haptics,
@@ -468,10 +431,10 @@ impl BadgeActivities {
                     Ok(_) => {}
                     Err(error) => log::warn!("result query pending: {error}"),
                 }
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                tokio::time::sleep(RESULT_WATCH_INTERVAL).await;
             }
             if let Ok(mut screen) = display.lock() {
-                let _ = screen.show_status(&identity.callsign, "RESULT PENDING");
+                let _ = screen.show_status(&identity.callsign, Status::ResultPending);
             }
         });
         *watcher = Some(ResultWatcher { game_id, task });
@@ -511,7 +474,7 @@ fn main() -> Result<()> {
         )
         .context("configure GPIO6 haptic PWM")?,
     )?));
-    show_status(&display, &identity.callsign, "BOOTING")?;
+    show_status(&display, &identity.callsign, Status::Booting)?;
 
     let sys_loop = EspSystemEventLoop::take().context("take system event loop")?;
     let nvs_partition = EspDefaultNvsPartition::take().context("take default NVS")?;
@@ -520,9 +483,9 @@ fn main() -> Result<()> {
         EspWifi::new(peripherals.modem, sys_loop.clone(), Some(nvs_partition))?,
         sys_loop,
     )?;
-    show_status(&display, &identity.callsign, "CONNECTING WIFI")?;
+    show_status(&display, &identity.callsign, Status::ConnectingWifi)?;
     connect_wifi(&mut wifi)?;
-    show_status(&display, &identity.callsign, "SYNCING TIME")?;
+    show_status(&display, &identity.callsign, Status::SyncingTime)?;
     let (_sntp, used_network_time) = sync_clock()?;
     if !used_network_time {
         log::warn!("using firmware build timestamp for TLS validation");
@@ -555,7 +518,7 @@ async fn run_worker(
     } else {
         format!("https://{TEMPORAL_ADDRESS}")
     };
-    show_status(&display, &identity.callsign, "CONNECTING CLOUD")?;
+    show_status(&display, &identity.callsign, Status::ConnectingCloud)?;
     let roots = RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     let verifier = WebPkiServerVerifier::builder(Arc::new(roots))
         .build()
@@ -649,49 +612,62 @@ async fn monitor_powerups(
     let handle = client.get_workflow_handle::<GameWorkflowRun>(ACTIVE_WORKFLOW_ID);
     let mut game_id = None;
     let mut sequence = 0;
+    let mut consecutive_errors = 0_u32;
     loop {
-        if let Ok(snapshot) = handle
+        match handle
             .query(GameWorkflow::snapshot, (), WorkflowQueryOptions::default())
             .await
         {
-            let doubled = snapshot
-                .chaos
-                .double_points_until_unix_ms
-                .is_some_and(|until| until > unix_ms());
-            point_value.store(if doubled { 2 } else { 1 }, Ordering::Release);
-            if snapshot.game_id != game_id {
-                game_id.clone_from(&snapshot.game_id);
-                sequence = 0;
+            Err(error) => {
+                consecutive_errors = consecutive_errors.saturating_add(1);
+                // Every 120th is once a minute at the 500 ms poll interval.
+                // Silence here is what made a badge that had lost Temporal
+                // look identical to one with no power-ups to show.
+                if consecutive_errors == 1 || consecutive_errors.is_multiple_of(120) {
+                    log::warn!("power-up poll has failed {consecutive_errors} time(s): {error}");
+                }
             }
-            if let Some(notice) = snapshot.chaos.latest_powerup
-                && notice.sequence > sequence
-            {
-                sequence = notice.sequence;
-                if snapshot.status == model::GameStatus::Running
-                    && unix_ms().saturating_sub(notice.issued_unix_ms) <= POWERUP_FRESHNESS_MS
+            Ok(snapshot) => {
+                consecutive_errors = 0;
+                let doubled = snapshot
+                    .chaos
+                    .double_points_until_unix_ms
+                    .is_some_and(|until| until > unix_ms());
+                point_value.store(if doubled { 2 } else { 1 }, Ordering::Release);
+                if snapshot.game_id != game_id {
+                    game_id.clone_from(&snapshot.game_id);
+                    sequence = 0;
+                }
+                if let Some(notice) = snapshot.chaos.latest_powerup
+                    && notice.sequence > sequence
                 {
-                    let _overlay = PowerupActiveGuard::new(Arc::clone(&powerup_active));
-                    if let Ok(mut screen) = display.lock() {
-                        match screen.show_powerup(&callsign, notice.command) {
-                            Ok(()) => log::info!(
-                                "Displayed Temporal power-up {:?} sequence {}",
-                                notice.command,
-                                notice.sequence
-                            ),
-                            Err(error) => log::error!("show power-up: {error:#}"),
+                    sequence = notice.sequence;
+                    if snapshot.status == model::GameStatus::Running
+                        && unix_ms().saturating_sub(notice.issued_unix_ms) <= POWERUP_FRESHNESS_MS
+                    {
+                        let _overlay = PowerupActiveGuard::new(Arc::clone(&powerup_active));
+                        if let Ok(mut screen) = display.lock() {
+                            match screen.show_powerup(&callsign, notice.command) {
+                                Ok(()) => log::info!(
+                                    "Displayed Temporal power-up {:?} sequence {}",
+                                    notice.command,
+                                    notice.sequence
+                                ),
+                                Err(error) => log::error!("show power-up: {error:#}"),
+                            }
                         }
-                    }
-                    haptics::play(&haptics, HapticEvent::Powerup).await;
-                    tokio::time::sleep(POWERUP_OVERLAY).await;
-                    let question = current_question.lock().ok().and_then(|task| task.clone());
-                    if let Ok(mut screen) = display.lock() {
-                        let result = if let Some(task) = question {
-                            screen.show_question(&callsign, &task.question)
-                        } else {
-                            screen.show_waiting(&callsign)
-                        };
-                        if let Err(error) = result {
-                            log::error!("restore screen after power-up: {error:#}");
+                        haptics::play(&haptics, HapticEvent::Powerup).await;
+                        tokio::time::sleep(POWERUP_OVERLAY).await;
+                        let question = current_question.lock().ok().and_then(|task| task.clone());
+                        if let Ok(mut screen) = display.lock() {
+                            let result = if let Some(task) = question {
+                                screen.show_question(&callsign, &task.question)
+                            } else {
+                                screen.show_waiting(&callsign)
+                            };
+                            if let Err(error) = result {
+                                log::error!("restore screen after power-up: {error:#}");
+                            }
                         }
                     }
                 }
@@ -708,18 +684,30 @@ fn unix_ms() -> u64 {
         .as_millis() as u64
 }
 
-fn show_status(display: &SharedDisplay, title: &str, detail: &str) -> Result<()> {
-    display
+/// Runs one drawing call against the shared display.
+///
+/// Six wrappers below each repeated the same lock-and-translate preamble; the
+/// only thing that varied was which `BadgeDisplay` method ran. They keep their
+/// own names because the call sites read better as `show_panic(...)` than as a
+/// closure, but the poisoned-lock handling now exists once.
+fn with_display<T>(
+    display: &SharedDisplay,
+    draw: impl FnOnce(&mut BadgeDisplay) -> Result<T>,
+) -> Result<T> {
+    let mut screen = display
         .lock()
-        .map_err(|_| anyhow!("display lock poisoned"))?
-        .show_status(title, detail)
+        .map_err(|_| anyhow!("display lock poisoned"))?;
+    draw(&mut screen)
+}
+
+fn show_status(display: &SharedDisplay, title: &str, status: Status) -> Result<()> {
+    with_display(display, |screen| screen.show_status(title, status))
 }
 
 fn show_question(display: &SharedDisplay, callsign: &str, task: &QuestionTask) -> Result<()> {
-    display
-        .lock()
-        .map_err(|_| anyhow!("display lock poisoned"))?
-        .show_question(callsign, &task.question)
+    with_display(display, |screen| {
+        screen.show_question(callsign, &task.question)
+    })
 }
 
 fn show_feedback(
@@ -728,31 +716,21 @@ fn show_feedback(
     correct: bool,
     score_delta: i32,
 ) -> Result<()> {
-    display
-        .lock()
-        .map_err(|_| anyhow!("display lock poisoned"))?
-        .show_feedback(callsign, correct, score_delta)
+    with_display(display, |screen| {
+        screen.show_feedback(callsign, correct, score_delta)
+    })
 }
 
 fn show_panic(display: &SharedDisplay, callsign: &str) -> Result<()> {
-    display
-        .lock()
-        .map_err(|_| anyhow!("display lock poisoned"))?
-        .show_panic(callsign)
+    with_display(display, |screen| screen.show_panic(callsign))
 }
 
 fn show_recovered(display: &SharedDisplay, callsign: &str) -> Result<()> {
-    display
-        .lock()
-        .map_err(|_| anyhow!("display lock poisoned"))?
-        .show_recovered(callsign)
+    with_display(display, |screen| screen.show_recovered(callsign))
 }
 
 fn show_waiting(display: &SharedDisplay, callsign: &str) -> Result<()> {
-    display
-        .lock()
-        .map_err(|_| anyhow!("display lock poisoned"))?
-        .show_waiting(callsign)
+    with_display(display, |screen| screen.show_waiting(callsign))
 }
 
 fn validate_config() -> Result<()> {

@@ -31,7 +31,9 @@ impl SessionStore {
         })
     }
 
-    pub fn begin_game(&self, game_id: &str, deadline_unix_ms: u64) -> Result<bool> {
+    /// Records the round this badge is playing, extending the stored deadline
+    /// if the Workflow granted the +30 second extension.
+    pub fn begin_game(&self, game_id: &str, deadline_unix_ms: u64) -> Result<()> {
         let mut stored = self
             .inner
             .lock()
@@ -53,7 +55,7 @@ impl SessionStore {
             save(&stored.nvs, &next)?;
             stored.session = next;
         }
-        Ok(is_new)
+        Ok(())
     }
 
     pub fn is_abandoned(&self, game_id: &str, question_id: &str) -> Result<bool> {
