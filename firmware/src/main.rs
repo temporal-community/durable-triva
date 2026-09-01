@@ -3,10 +3,10 @@ mod haptics;
 #[cfg(feature = "hil")]
 mod hil;
 mod identity;
-mod input;
 mod model;
 mod power;
 mod session;
+mod ui;
 
 use std::{
     convert::TryInto,
@@ -51,21 +51,20 @@ use badge_screen::Status;
 
 use crate::{
     display::BadgeDisplay,
-    haptics::{BadgeHaptics, HapticEvent, SharedHaptics},
+    haptics::BadgeHaptics,
     identity::{BadgeIdentity, factory_identity},
-    input::ButtonReader,
     model::{
         BADGE_CRASH_BLACKOUT_MS, BADGE_HEARTBEAT_INTERVAL_MS, BADGE_TASK_QUEUE, BadgeAnswer,
         BadgeEvent, GameInput, GameSnapshot, QuestionTask, heartbeat_budget_exhausted,
     },
     session::SessionStore,
+    ui::{Ui, UiRequest},
 };
 
 include!(concat!(env!("OUT_DIR"), "/firmware_config.rs"));
 const HEARTBEAT_BLACKOUT: Duration = Duration::from_millis(BADGE_CRASH_BLACKOUT_MS);
 const WORKER_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 const MAX_ACTIVITY_RUNTIME: Duration = Duration::from_secs(120);
-const POWERUP_OVERLAY: Duration = Duration::from_millis(1_500);
 const POWERUP_FRESHNESS_MS: u64 = 5_000;
 /// How often a badge asks the Workflow whether a power-up has landed.
 ///
@@ -88,14 +87,6 @@ const RESULT_WATCH_POLLS: u32 = 45;
 /// Keep final standings readable, then make an idle badge visibly ready for
 /// the next round instead of leaving stale results on screen.
 const RESULT_HOLD: Duration = Duration::from_secs(5);
-/// How long the watcher keeps trying to hand the screen back after its hold.
-///
-/// The Activity from a finished round can outlive its Workflow briefly, and it
-/// owns the screen while it does. One attempt at the end of the hold could
-/// therefore find the badge busy, skip the restore and leave the final
-/// standings up for good.
-const RESULT_RESTORE_POLLS: u32 = 20;
-const RESULT_RESTORE_INTERVAL: Duration = Duration::from_millis(500);
 /// How long a badge waits before failing an Activity for a question it has
 /// already abandoned, so the retry has a moment to reach a different Worker.
 const ABANDONED_REFUSAL_BACKOFF: Duration = Duration::from_millis(250);
@@ -106,7 +97,6 @@ const ABANDONED_REFUSAL_BACKOFF: Duration = Duration::from_millis(250);
 /// do exactly that, for the whole life of a question, and neither said a word.
 const INPUT_DIAGNOSTIC_INTERVAL: Duration = Duration::from_millis(2_000);
 
-type SharedDisplay = Arc<Mutex<BadgeDisplay>>;
 type SharedQuestion = Arc<Mutex<Option<QuestionTask>>>;
 
 #[workflow]
@@ -141,9 +131,7 @@ impl GameWorkflow {
 type GameWorkflowRun = <GameWorkflow as temporalio_common::HasWorkflowDefinition>::Run;
 
 struct BadgeActivities {
-    display: SharedDisplay,
-    haptics: SharedHaptics,
-    input: ButtonReader,
+    ui: Ui,
     identity: BadgeIdentity,
     session: Arc<SessionStore>,
     result_watcher: Mutex<Option<ResultWatcher>>,
@@ -215,8 +203,6 @@ struct ActivityActiveGuard(Arc<AtomicBool>);
 
 struct CurrentQuestionGuard(SharedQuestion);
 
-struct PowerupActiveGuard(Arc<AtomicBool>);
-
 impl ActivityActiveGuard {
     fn new(active: Arc<AtomicBool>) -> Self {
         active.store(true, Ordering::Release);
@@ -244,19 +230,6 @@ impl Drop for CurrentQuestionGuard {
         if let Ok(mut current) = self.0.lock() {
             *current = None;
         }
-    }
-}
-
-impl PowerupActiveGuard {
-    fn new(active: Arc<AtomicBool>) -> Self {
-        active.store(true, Ordering::Release);
-        Self(active)
-    }
-}
-
-impl Drop for PowerupActiveGuard {
-    fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
     }
 }
 
@@ -312,7 +285,7 @@ impl BadgeActivities {
         // The Activity payload already contains everything needed to draw the
         // question. Do that before NVS or Cloud telemetry so a slow Signal can
         // never make a newly assigned badge look frozen.
-        show_question(&self.display, &self.identity.callsign, &task)?;
+        self.ui.show(UiRequest::Question(Box::new(task.clone())));
         // From here until this Activity lets go, heartbeats are somebody
         // else's job. Nothing below may block on the network.
         let heartbeat = Self::spawn_heartbeat(&ctx);
@@ -339,23 +312,12 @@ impl BadgeActivities {
                 );
                 let correct = selected_index == task.question.correct_index;
                 let points = self.point_value.load(Ordering::Acquire);
-                show_feedback(
-                    &self.display,
-                    &self.identity.callsign,
+                self.ui.show(UiRequest::Feedback {
                     correct,
-                    if correct { points } else { -points },
-                )?;
-                haptics::play(
-                    &self.haptics,
-                    if correct {
-                        HapticEvent::Correct
-                    } else {
-                        HapticEvent::Wrong
-                    },
-                )
-                .await;
+                    score_delta: if correct { points } else { -points },
+                });
                 tokio::time::sleep(FEEDBACK_HOLD).await;
-                show_waiting(&self.display, &self.identity.callsign)?;
+                self.ui.show(UiRequest::Waiting);
                 let answer = BadgeAnswer {
                     badge_id: self.identity.id.clone(),
                     callsign: self.identity.callsign.clone(),
@@ -373,8 +335,7 @@ impl BadgeActivities {
                 // Temporal's timeout in silence.
                 drop(heartbeat);
                 self.session.abandon(&task.game_id, &task.question.id)?;
-                show_panic(&self.display, &self.identity.callsign)?;
-                haptics::play(&self.haptics, HapticEvent::Crash).await;
+                self.ui.show(UiRequest::Crashed);
                 if let Some(handle) = ctx.workflow_handle::<GameWorkflow>() {
                     match tokio::time::timeout(
                         GAME_SIGNAL_TIMEOUT,
@@ -400,8 +361,7 @@ impl BadgeActivities {
                 // Intentionally do not heartbeat or complete. Temporal's
                 // heartbeat timeout retries this Activity on another Worker.
                 tokio::time::sleep(HEARTBEAT_BLACKOUT).await;
-                show_recovered(&self.display, &self.identity.callsign)?;
-                haptics::play(&self.haptics, HapticEvent::Recovered).await;
+                self.ui.show(UiRequest::Recovered);
                 if let Some(handle) = ctx.workflow_handle::<GameWorkflow>() {
                     match tokio::time::timeout(
                         GAME_SIGNAL_TIMEOUT,
@@ -437,10 +397,9 @@ impl BadgeActivities {
         let local_deadline = Instant::now() + MAX_ACTIVITY_RUNTIME;
         // Anything the sampler recognised before this question opened was
         // aimed at the previous screen.
-        self.input.discard_pending();
         let opened_at = Instant::now();
         let mut last_diagnostic = Instant::now();
-        let opening_ticks = self.input.ticks();
+        let opening_ticks = self.ui.ticks();
         loop {
             if ctx.is_cancelled() {
                 log::warn!(
@@ -479,7 +438,7 @@ impl BadgeActivities {
                     anyhow!("no Activity heartbeat acknowledged for {silent_ms} ms").into(),
                 );
             }
-            if let Some(choice) = self.input.next_choice() {
+            if let Some(choice) = self.ui.next_choice() {
                 return Ok(choice);
             }
             // The sampler's tick count is the honest health signal now: this
@@ -491,7 +450,7 @@ impl BadgeActivities {
                     "Input idle {} ms into attempt {}: sampler_ticks={} silent_hb={} ms heap={} low={}",
                     opened_at.elapsed().as_millis(),
                     ctx.info().attempt,
-                    self.input.ticks().saturating_sub(opening_ticks),
+                    self.ui.ticks().saturating_sub(opening_ticks),
                     heartbeat.silent_ms(),
                     free_heap(),
                     lowest_heap()
@@ -641,9 +600,7 @@ impl BadgeActivities {
         if let Some(previous) = watcher.take() {
             previous.task.abort();
         }
-        let display = Arc::clone(&self.display);
-        let haptics = Arc::clone(&self.haptics);
-        let activity_active = Arc::clone(&self.activity_active);
+        let ui = self.ui.clone();
         let identity = self.identity.clone();
         let deadline_unix_ms = task.deadline_unix_ms;
         let game_id = task.game_id.clone();
@@ -658,62 +615,27 @@ impl BadgeActivities {
                     .await
                 {
                     Ok(snapshot) if snapshot.status == model::GameStatus::Finished => {
-                        let won = snapshot.winners.contains(&identity.callsign);
                         log::info!(
                             "Round {watched_game_id} finished; showing standings for {}",
                             identity.callsign
                         );
-                        if let Err(error) =
-                            with_display_if_idle(&display, &activity_active, |screen| {
-                                screen.show_results(&identity.callsign, &identity.id, &snapshot)
-                            })
-                        {
-                            log::error!("show final results: {error:#}");
-                        }
-                        haptics::play(
-                            &haptics,
-                            if won {
-                                HapticEvent::Winner
-                            } else {
-                                HapticEvent::RoundOver
-                            },
-                        )
-                        .await;
+                        ui.show(UiRequest::Results(Box::new(snapshot)));
                         tokio::time::sleep(RESULT_HOLD).await;
-                        // Keep offering the screen back until the round's own
-                        // Activity lets go. The ownership check still refuses
-                        // to paint over a question from a newer round, which
-                        // is the case this whole check exists for.
-                        for attempt in 0..RESULT_RESTORE_POLLS {
-                            match with_display_if_idle(&display, &activity_active, |screen| {
-                                screen.show_waiting(&identity.callsign)
-                            }) {
-                                Ok(true) => {
-                                    log::info!(
-                                        "Result hold complete; {} returned to waiting",
-                                        identity.callsign
-                                    );
-                                    return;
-                                }
-                                Ok(false) => {
-                                    if attempt == 0 {
-                                        log::info!(
-                                            "{} still owns the screen; waiting to restore",
-                                            identity.callsign
-                                        );
-                                    }
-                                    tokio::time::sleep(RESULT_RESTORE_INTERVAL).await;
-                                }
-                                Err(error) => {
-                                    log::error!("restore waiting screen: {error:#}");
-                                    return;
-                                }
-                            }
+                        // The UI thread refuses both of these while a question
+                        // owns the screen, so a badge already back in play
+                        // keeps its question and this simply does nothing.
+                        if ui.answering() {
+                            log::info!(
+                                "Result hold complete; {} is already back on a question",
+                                identity.callsign
+                            );
+                        } else {
+                            ui.show(UiRequest::Waiting);
+                            log::info!(
+                                "Result hold complete; {} returned to waiting",
+                                identity.callsign
+                            );
                         }
-                        log::warn!(
-                            "Result hold complete; {} is still holding a question, leaving it alone",
-                            identity.callsign
-                        );
                         return;
                     }
                     Ok(_) => {}
@@ -725,9 +647,7 @@ impl BadgeActivities {
                 "No final standings for {} after {RESULT_WATCH_POLLS} polls; showing RESULT PENDING",
                 identity.callsign
             );
-            let _ = with_display_if_idle(&display, &activity_active, |screen| {
-                screen.show_status(&identity.callsign, Status::ResultPending)
-            });
+            ui.show(UiRequest::ResultPending);
         });
         *watcher = Some(ResultWatcher { game_id, task });
         Ok(())
@@ -742,37 +662,38 @@ fn main() -> Result<()> {
     log::info!("Temporal Trivia badge booting as {}", identity.callsign);
 
     let peripherals = Peripherals::take().context("take ESP32 peripherals")?;
-    let display = Arc::new(Mutex::new(BadgeDisplay::new(
+    let display = BadgeDisplay::new(
         peripherals.i2c0,
         peripherals.pins.gpio4,
         peripherals.pins.gpio5,
-    )?));
-    // Owned here rather than in `run_worker` because the button sampler is
-    // started before Temporal is and outlives any one Activity.
-    let activity_active = Arc::new(AtomicBool::new(false));
-    let powerup_active = Arc::new(AtomicBool::new(false));
-    let input = ButtonReader::start(
-        peripherals.pins.gpio7,
-        peripherals.pins.gpio18,
-        peripherals.pins.gpio17,
-        peripherals.pins.gpio0,
-        Arc::clone(&activity_active),
-        Arc::clone(&powerup_active),
     )?;
     let haptic_timer = LedcTimerDriver::new(
         peripherals.ledc.timer0,
         &TimerConfig::new().frequency(Hertz(80)),
     )
     .context("configure haptic PWM timer")?;
-    let haptics = Arc::new(tokio::sync::Mutex::new(BadgeHaptics::new(
+    let haptics = BadgeHaptics::new(
         LedcDriver::new(
             peripherals.ledc.channel0,
             haptic_timer,
             peripherals.pins.gpio6,
         )
         .context("configure GPIO6 haptic PWM")?,
-    )?));
-    show_status(&display, &identity.callsign, Status::Booting)?;
+    )?;
+    // The UI thread takes the screen, the buttons and the motor, and it is the
+    // only thing that ever touches them. It starts before Temporal does so the
+    // badge can say what it is doing while it connects.
+    let ui = ui::start(
+        display,
+        haptics,
+        peripherals.pins.gpio7,
+        peripherals.pins.gpio18,
+        peripherals.pins.gpio17,
+        peripherals.pins.gpio0,
+        identity.callsign.clone(),
+        identity.id.clone(),
+    )?;
+    ui.show(UiRequest::Status(Status::Booting));
 
     let sys_loop = EspSystemEventLoop::take().context("take system event loop")?;
     let nvs_partition = EspDefaultNvsPartition::take().context("take default NVS")?;
@@ -781,9 +702,9 @@ fn main() -> Result<()> {
         EspWifi::new(peripherals.modem, sys_loop.clone(), Some(nvs_partition))?,
         sys_loop,
     )?;
-    show_status(&display, &identity.callsign, Status::ConnectingWifi)?;
+    ui.show(UiRequest::Status(Status::ConnectingWifi));
     connect_wifi(&mut wifi)?;
-    show_status(&display, &identity.callsign, Status::SyncingTime)?;
+    ui.show(UiRequest::Status(Status::SyncingTime));
     let (_sntp, used_network_time) = sync_clock()?;
     if !used_network_time {
         log::warn!("using firmware build timestamp for TLS validation");
@@ -794,26 +715,10 @@ fn main() -> Result<()> {
         .enable_all()
         .build()
         .context("build single-thread Tokio runtime")?;
-    runtime.block_on(Box::pin(run_worker(
-        display,
-        input,
-        haptics,
-        identity,
-        session,
-        activity_active,
-        powerup_active,
-    )))
+    runtime.block_on(Box::pin(run_worker(ui, identity, session)))
 }
 
-async fn run_worker(
-    display: SharedDisplay,
-    input: ButtonReader,
-    haptics: SharedHaptics,
-    identity: BadgeIdentity,
-    session: Arc<SessionStore>,
-    activity_active: Arc<AtomicBool>,
-    powerup_active: Arc<AtomicBool>,
-) -> Result<()> {
+async fn run_worker(ui: Ui, identity: BadgeIdentity, session: Arc<SessionStore>) -> Result<()> {
     let runtime_options = RuntimeOptions::builder()
         .heartbeat_interval(Some(WORKER_HEARTBEAT_INTERVAL))
         .build()
@@ -824,7 +729,7 @@ async fn run_worker(
     } else {
         format!("https://{TEMPORAL_ADDRESS}")
     };
-    show_status(&display, &identity.callsign, Status::ConnectingCloud)?;
+    ui.show(UiRequest::Status(Status::ConnectingCloud));
     let roots = RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     let verifier = WebPkiServerVerifier::builder(Arc::new(roots))
         .build()
@@ -840,6 +745,7 @@ async fn run_worker(
     let mut tuner = TunerBuilder::default();
     tuner.activity_slot_supplier(Arc::new(FixedSizeSlotSupplier::<ActivitySlotKind>::new(1)));
     let point_value = Arc::new(AtomicI32::new(1));
+    let activity_active = Arc::new(AtomicBool::new(false));
     let current_question = Arc::new(Mutex::new(None));
     let worker_identity = format!("badge/{}", identity.callsign);
     let worker_options = WorkerOptions::new(BADGE_TASK_QUEUE)
@@ -850,9 +756,7 @@ async fn run_worker(
             "temporal-trivia-badge-0.1.0".to_owned(),
         ))
         .register_activities(BadgeActivities {
-            display: Arc::clone(&display),
-            haptics: Arc::clone(&haptics),
-            input: input.clone(),
+            ui: ui.clone(),
             identity: identity.clone(),
             session,
             result_watcher: Mutex::new(None),
@@ -868,48 +772,18 @@ async fn run_worker(
     let powerup_client = client.clone();
     let mut worker = Worker::new(&sdk_runtime, client, worker_options)
         .map_err(|error| anyhow!(error.to_string()))?;
-    show_waiting(&display, &identity.callsign)?;
+    ui.show(UiRequest::Waiting);
     #[cfg(feature = "hil")]
     hil::start(
-        input.clone(),
+        ui.clone(),
         Arc::clone(&activity_active),
         Arc::clone(&current_question),
         Arc::clone(&worker_polling),
         identity.callsign.clone(),
     )?;
-    let sleep_display = Arc::clone(&display);
-    let sleep_input = input.clone();
-    let sleep_haptics = Arc::clone(&haptics);
-    let sleep_callsign = identity.callsign.clone();
-    let powerup_display = Arc::clone(&display);
-    let powerup_haptics = Arc::clone(&haptics);
-    let powerup_callsign = identity.callsign.clone();
-    let powerup_flag = Arc::clone(&powerup_active);
+    let powerup_ui = ui.clone();
     tokio::spawn(async move {
-        monitor_powerups(
-            powerup_client,
-            powerup_display,
-            powerup_haptics,
-            powerup_callsign,
-            current_question,
-            powerup_flag,
-            point_value,
-        )
-        .await;
-    });
-    tokio::spawn(async move {
-        if let Err(error) = power::monitor(
-            sleep_display,
-            sleep_input,
-            sleep_haptics,
-            activity_active,
-            powerup_active,
-            sleep_callsign,
-        )
-        .await
-        {
-            log::error!("sleep monitor stopped: {error:#}");
-        }
+        monitor_powerups(powerup_client, powerup_ui, point_value).await;
     });
     log::info!("Polling trivia queue {BADGE_TASK_QUEUE} as {worker_identity}");
     worker_polling.store(true, Ordering::Release);
@@ -917,15 +791,7 @@ async fn run_worker(
     Ok(())
 }
 
-async fn monitor_powerups(
-    client: Client,
-    display: SharedDisplay,
-    haptics: SharedHaptics,
-    callsign: String,
-    current_question: SharedQuestion,
-    powerup_active: Arc<AtomicBool>,
-    point_value: Arc<AtomicI32>,
-) {
+async fn monitor_powerups(client: Client, ui: Ui, point_value: Arc<AtomicI32>) {
     let handle = client.get_workflow_handle::<GameWorkflowRun>(ACTIVE_WORKFLOW_ID);
     let mut game_id = None;
     let mut sequence = 0;
@@ -969,30 +835,14 @@ async fn monitor_powerups(
                     if snapshot.status == model::GameStatus::Running
                         && unix_ms().saturating_sub(notice.issued_unix_ms) <= POWERUP_FRESHNESS_MS
                     {
-                        let _overlay = PowerupActiveGuard::new(Arc::clone(&powerup_active));
-                        if let Ok(mut screen) = display.lock() {
-                            match screen.show_powerup(&callsign, notice.command) {
-                                Ok(()) => log::info!(
-                                    "Displayed Temporal power-up {:?} sequence {}",
-                                    notice.command,
-                                    notice.sequence
-                                ),
-                                Err(error) => log::error!("show power-up: {error:#}"),
-                            }
-                        }
-                        haptics::play(&haptics, HapticEvent::Powerup).await;
-                        tokio::time::sleep(POWERUP_OVERLAY).await;
-                        let question = current_question.lock().ok().and_then(|task| task.clone());
-                        if let Ok(mut screen) = display.lock() {
-                            let result = if let Some(task) = question {
-                                screen.show_question(&callsign, &task.question)
-                            } else {
-                                screen.show_waiting(&callsign)
-                            };
-                            if let Err(error) = result {
-                                log::error!("restore screen after power-up: {error:#}");
-                            }
-                        }
+                        // The UI thread owns the overlay's lifetime and knows
+                        // what to put back underneath it, so this just asks.
+                        log::info!(
+                            "Temporal power-up {:?} sequence {}",
+                            notice.command,
+                            notice.sequence
+                        );
+                        ui.show(UiRequest::Powerup(notice.command));
                     }
                 }
             }
@@ -1023,77 +873,6 @@ fn unix_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
-}
-
-/// Runs one drawing call against the shared display.
-///
-/// Six wrappers below each repeated the same lock-and-translate preamble; the
-/// only thing that varied was which `BadgeDisplay` method ran. They keep their
-/// own names because the call sites read better as `show_panic(...)` than as a
-/// closure, but the poisoned-lock handling now exists once.
-fn with_display<T>(
-    display: &SharedDisplay,
-    draw: impl FnOnce(&mut BadgeDisplay) -> Result<T>,
-) -> Result<T> {
-    let mut screen = display
-        .lock()
-        .map_err(|_| anyhow!("display lock poisoned"))?;
-    draw(&mut screen)
-}
-
-/// Runs one drawing call only while no Activity owns the screen.
-///
-/// Three tasks draw to one OLED: the Activity, the sleep monitor and the
-/// result watcher. Only the Activity may overwrite a live question, and the
-/// other two used to check `activity_active` before taking the display lock --
-/// which leaves a window where a question is drawn in between, and nothing
-/// ever redraws it. Checking under the lock closes that window. `Ok(false)`
-/// means the draw was correctly skipped, not that anything failed.
-pub(crate) fn with_display_if_idle(
-    display: &SharedDisplay,
-    activity_active: &AtomicBool,
-    draw: impl FnOnce(&mut BadgeDisplay) -> Result<()>,
-) -> Result<bool> {
-    let mut screen = display
-        .lock()
-        .map_err(|_| anyhow!("display lock poisoned"))?;
-    if activity_active.load(Ordering::Acquire) {
-        return Ok(false);
-    }
-    draw(&mut screen).map(|()| true)
-}
-
-fn show_status(display: &SharedDisplay, title: &str, status: Status) -> Result<()> {
-    with_display(display, |screen| screen.show_status(title, status))
-}
-
-fn show_question(display: &SharedDisplay, callsign: &str, task: &QuestionTask) -> Result<()> {
-    with_display(display, |screen| {
-        screen.show_question(callsign, &task.question)
-    })
-}
-
-fn show_feedback(
-    display: &SharedDisplay,
-    callsign: &str,
-    correct: bool,
-    score_delta: i32,
-) -> Result<()> {
-    with_display(display, |screen| {
-        screen.show_feedback(callsign, correct, score_delta)
-    })
-}
-
-fn show_panic(display: &SharedDisplay, callsign: &str) -> Result<()> {
-    with_display(display, |screen| screen.show_panic(callsign))
-}
-
-fn show_recovered(display: &SharedDisplay, callsign: &str) -> Result<()> {
-    with_display(display, |screen| screen.show_recovered(callsign))
-}
-
-fn show_waiting(display: &SharedDisplay, callsign: &str) -> Result<()> {
-    with_display(display, |screen| screen.show_waiting(callsign))
 }
 
 fn validate_config() -> Result<()> {

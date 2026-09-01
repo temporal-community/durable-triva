@@ -1,24 +1,10 @@
-use std::{
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
-    time::Duration,
-};
+//! Deep sleep, and the wake sources that bring the badge back.
+//!
+//! The gesture that triggers this lives in [`crate::ui`], which owns the
+//! buttons and the screen. What is left here is the ESP-IDF sequence itself.
 
 use anyhow::{Result, bail};
 use esp_idf_svc::sys;
-
-use crate::{
-    display::BadgeDisplay,
-    haptics::{self, HapticEvent, SharedHaptics},
-    input::ButtonReader,
-    with_display_if_idle,
-};
-
-const SLEEP_ARM_DELAY: Duration = Duration::from_millis(250);
-const SLEEP_HOLD: Duration = Duration::from_secs(3);
-const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 // Keep the original Echo revision nets (MCU_SLEEP/INT_PWR) in the mask, but
 // also arm the physical face-button GPIOs. The tested badge does not pull
@@ -40,80 +26,6 @@ const BUTTON_WAKE_MASK: u64 = (1_u64 << sys::gpio_num_t_GPIO_NUM_0)
     | (1_u64 << sys::gpio_num_t_GPIO_NUM_17)
     | (1_u64 << sys::gpio_num_t_GPIO_NUM_18);
 
-pub async fn monitor(
-    display: Arc<Mutex<BadgeDisplay>>,
-    input: ButtonReader,
-    haptics: SharedHaptics,
-    activity_active: Arc<AtomicBool>,
-    powerup_active: Arc<AtomicBool>,
-    callsign: String,
-) -> Result<()> {
-    let mut shown_second: Option<u64> = None;
-
-    loop {
-        if activity_active.load(Ordering::Acquire) || powerup_active.load(Ordering::Acquire) {
-            shown_second = None;
-            tokio::time::sleep(POLL_INTERVAL).await;
-            continue;
-        }
-
-        // The button sampler owns the pins and times the hold, so this loop
-        // being slow can delay the countdown but can no longer misread it.
-        let elapsed = input.down_held();
-        if elapsed.is_zero() {
-            if shown_second.take().is_some() {
-                // A question can be assigned between the check at the top of
-                // this loop and here, so ownership is re-tested under the
-                // display lock rather than trusted from a few lines ago.
-                with_display_if_idle(&display, &activity_active, |screen| {
-                    screen.show_waiting(&callsign)
-                })?;
-            }
-            tokio::time::sleep(POLL_INTERVAL).await;
-            continue;
-        }
-        if elapsed >= SLEEP_HOLD {
-            log::info!("DOWN held for 3 seconds; entering deep sleep");
-            if shown_second != Some(0) {
-                shown_second = Some(0);
-                with_display_if_idle(&display, &activity_active, |screen| {
-                    screen.show_sleep_countdown(&callsign, 0)
-                })?;
-                haptics::play(&haptics, HapticEvent::SleepCountdown).await;
-            }
-            if !with_display_if_idle(&display, &activity_active, |screen| {
-                screen.show_sleeping(&callsign)
-            })? {
-                // A question arrived while the countdown was finishing. The
-                // player is in a round now; sleeping would drop them out of it.
-                shown_second = None;
-                tokio::time::sleep(POLL_INTERVAL).await;
-                continue;
-            }
-            while !input.all_released() {
-                tokio::time::sleep(POLL_INTERVAL).await;
-            }
-            with_display_if_idle(&display, &activity_active, |screen| screen.power_off())?;
-            haptics::off(&haptics).await?;
-            enter_deep_sleep()?;
-        }
-
-        if elapsed >= SLEEP_ARM_DELAY {
-            let remaining_ms = SLEEP_HOLD.saturating_sub(elapsed).as_millis() as u64;
-            let remaining_seconds = remaining_ms.div_ceil(1000);
-            if shown_second != Some(remaining_seconds) {
-                shown_second = Some(remaining_seconds);
-                with_display_if_idle(&display, &activity_active, |screen| {
-                    screen.show_sleep_countdown(&callsign, remaining_seconds)
-                })?;
-                haptics::play(&haptics, HapticEvent::SleepCountdown).await;
-            }
-        }
-
-        tokio::time::sleep(POLL_INTERVAL).await;
-    }
-}
-
 fn check(code: sys::esp_err_t, operation: &str) -> Result<()> {
     if code != sys::ESP_OK {
         bail!("{operation} failed with ESP-IDF error {code}");
@@ -121,7 +33,7 @@ fn check(code: sys::esp_err_t, operation: &str) -> Result<()> {
     Ok(())
 }
 
-fn enter_deep_sleep() -> Result<()> {
+pub fn enter_deep_sleep() -> Result<()> {
     // SAFETY: every GPIO in `BUTTON_WAKE_GPIOS` is RTC-capable on the ESP32-S3
     // used by this fixed badge revision. Calls are sequenced according to the
     // ESP-IDF deep-sleep API, and `check` validates every fallible return code.

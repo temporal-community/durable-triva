@@ -1,8 +1,15 @@
-use std::{sync::Arc, time::Duration};
+//! The vibration motor, as data plus a setter.
+//!
+//! Patterns used to be `async fn`s that awaited between pulses. They now
+//! describe themselves as steps and the UI thread advances them, because that
+//! thread also samples the buttons every 5 ms: a pattern that blocked for its
+//! 300 ms would drop presses on the floor, which is the exact fault the
+//! dedicated thread exists to prevent.
+
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use esp_idf_svc::hal::ledc::LedcDriver;
-use tokio::sync::Mutex;
 
 const ORIGINAL_STRENGTH: u8 = 155;
 const SOFT_STRENGTH: u8 = 110;
@@ -10,9 +17,7 @@ const FIRM_STRENGTH: u8 = 200;
 const ORIGINAL_PULSE: Duration = Duration::from_millis(35);
 const PATTERN_GAP: Duration = Duration::from_millis(80);
 
-pub type SharedHaptics = Arc<Mutex<BadgeHaptics>>;
-
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HapticEvent {
     SleepCountdown,
     Correct,
@@ -24,31 +29,56 @@ pub enum HapticEvent {
     RoundOver,
 }
 
+/// One step of a pattern: hold the motor at `strength` for `duration`.
+/// Strength zero is the silence between pulses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HapticStep {
+    pub strength: u8,
+    pub duration: Duration,
+}
+
+const fn pulse(strength: u8) -> HapticStep {
+    HapticStep {
+        strength,
+        duration: ORIGINAL_PULSE,
+    }
+}
+
+const GAP: HapticStep = HapticStep {
+    strength: 0,
+    duration: PATTERN_GAP,
+};
+
+// Named so each pattern is a real `'static` slice rather than a temporary.
+const SINGLE: [HapticStep; 1] = [pulse(ORIGINAL_STRENGTH)];
+const DOUBLE_SOFT: [HapticStep; 3] = [pulse(SOFT_STRENGTH), GAP, pulse(SOFT_STRENGTH)];
+const DOUBLE: [HapticStep; 3] = [pulse(ORIGINAL_STRENGTH), GAP, pulse(ORIGINAL_STRENGTH)];
+const THUMP: [HapticStep; 1] = [HapticStep {
+    strength: FIRM_STRENGTH,
+    duration: Duration::from_millis(120),
+}];
+const RISE: [HapticStep; 5] = [
+    pulse(SOFT_STRENGTH),
+    GAP,
+    pulse(135),
+    GAP,
+    pulse(ORIGINAL_STRENGTH),
+];
+
+/// The steps that make up one event's feel.
+#[must_use]
+pub fn pattern(event: HapticEvent) -> &'static [HapticStep] {
+    match event {
+        HapticEvent::SleepCountdown | HapticEvent::Correct | HapticEvent::RoundOver => &SINGLE,
+        HapticEvent::Wrong => &DOUBLE_SOFT,
+        HapticEvent::Crash => &THUMP,
+        HapticEvent::Recovered | HapticEvent::Powerup => &DOUBLE,
+        HapticEvent::Winner => &RISE,
+    }
+}
+
 pub struct BadgeHaptics {
     driver: LedcDriver<'static>,
-}
-
-struct MotorOffGuard<'a> {
-    driver: &'a mut LedcDriver<'static>,
-    armed: bool,
-}
-
-impl MotorOffGuard<'_> {
-    fn stop(mut self) -> Result<()> {
-        self.driver.set_duty(0).context("stop haptic motor")?;
-        self.armed = false;
-        Ok(())
-    }
-}
-
-impl Drop for MotorOffGuard<'_> {
-    fn drop(&mut self) {
-        if self.armed
-            && let Err(error) = self.driver.set_duty(0)
-        {
-            log::error!("emergency haptic motor stop failed: {error}");
-        }
-    }
 }
 
 impl BadgeHaptics {
@@ -57,66 +87,13 @@ impl BadgeHaptics {
         Ok(Self { driver })
     }
 
-    async fn pulse(&mut self, strength: u8, duration: Duration) -> Result<()> {
+    /// Drives the motor at `strength`, where zero is off.
+    pub fn set(&mut self, strength: u8) -> Result<()> {
         let duty = self.driver.get_max_duty() * u32::from(strength) / u32::from(u8::MAX);
-        self.driver.set_duty(duty).context("start haptic pulse")?;
-        let guard = MotorOffGuard {
-            driver: &mut self.driver,
-            armed: true,
-        };
-        tokio::time::sleep(duration).await;
-        guard.stop()
-    }
-
-    async fn gap(&self) {
-        tokio::time::sleep(PATTERN_GAP).await;
-    }
-
-    async fn play(&mut self, event: HapticEvent) -> Result<()> {
-        match event {
-            HapticEvent::SleepCountdown | HapticEvent::Correct | HapticEvent::RoundOver => {
-                self.pulse(ORIGINAL_STRENGTH, ORIGINAL_PULSE).await?;
-            }
-            HapticEvent::Wrong => {
-                self.pulse(SOFT_STRENGTH, ORIGINAL_PULSE).await?;
-                self.gap().await;
-                self.pulse(SOFT_STRENGTH, ORIGINAL_PULSE).await?;
-            }
-            HapticEvent::Crash => {
-                self.pulse(FIRM_STRENGTH, Duration::from_millis(120))
-                    .await?;
-            }
-            HapticEvent::Recovered | HapticEvent::Powerup => {
-                self.pulse(ORIGINAL_STRENGTH, ORIGINAL_PULSE).await?;
-                self.gap().await;
-                self.pulse(ORIGINAL_STRENGTH, ORIGINAL_PULSE).await?;
-            }
-            HapticEvent::Winner => {
-                for (index, strength) in [SOFT_STRENGTH, 135, ORIGINAL_STRENGTH]
-                    .into_iter()
-                    .enumerate()
-                {
-                    self.pulse(strength, ORIGINAL_PULSE).await?;
-                    if index < 2 {
-                        self.gap().await;
-                    }
-                }
-            }
-        }
-        Ok(())
+        self.driver.set_duty(duty).context("set haptic strength")
     }
 
     pub fn off(&mut self) -> Result<()> {
-        self.driver.set_duty(0).context("stop haptic motor")
+        self.set(0)
     }
-}
-
-pub async fn play(haptics: &SharedHaptics, event: HapticEvent) {
-    if let Err(error) = haptics.lock().await.play(event).await {
-        log::error!("haptic {event:?} failed: {error:#}");
-    }
-}
-
-pub async fn off(haptics: &SharedHaptics) -> Result<()> {
-    haptics.lock().await.off()
 }

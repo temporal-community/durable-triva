@@ -10,7 +10,10 @@ use std::{
 
 use anyhow::{Context, Result};
 
-use crate::{input::ButtonReader, model::QuestionTask};
+use crate::{
+    model::QuestionTask,
+    ui::{Ui, UiRequest},
+};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const MAX_COMMAND_BYTES: usize = 96;
@@ -24,10 +27,11 @@ const MAX_COMMAND_BYTES: usize = 96;
 /// handed to an attendee must not have it.
 ///
 /// Commands are accepted only while this physical badge owns a question:
-/// `HIL ANSWER CORRECT` selects the question's known correct index, while
-/// `HIL ANSWER 0` through `3` exercise an explicit directional mapping.
+/// `HIL ANSWER CORRECT` selects the question's known correct index,
+/// `HIL ANSWER 0` through `3` exercise an explicit directional mapping, and
+/// `HIL CRASH` holds both side buttons past the crash threshold.
 pub fn start(
-    input: ButtonReader,
+    input: Ui,
     activity_active: Arc<AtomicBool>,
     current_question: Arc<Mutex<Option<QuestionTask>>>,
     worker_polling: Arc<AtomicBool>,
@@ -53,7 +57,7 @@ pub fn start(
 }
 
 fn read_commands(
-    input: ButtonReader,
+    input: Ui,
     activity_active: Arc<AtomicBool>,
     current_question: Arc<Mutex<Option<QuestionTask>>>,
     worker_polling: Arc<AtomicBool>,
@@ -104,7 +108,7 @@ fn read_commands(
 
 fn handle_command(
     line: &str,
-    input: &ButtonReader,
+    input: &Ui,
     activity_active: &Arc<AtomicBool>,
     current_question: &Arc<Mutex<Option<QuestionTask>>>,
     worker_polling: &Arc<AtomicBool>,
@@ -126,6 +130,16 @@ fn handle_command(
             activity_active.load(Ordering::Acquire),
             question_id
         );
+        return;
+    }
+
+    if line == "HIL CRASH" {
+        if !activity_active.load(Ordering::Acquire) {
+            log::warn!("HIL REJECT no-active-question");
+            return;
+        }
+        input.show(UiRequest::InjectCrash);
+        log::info!("HIL ACK crash callsign={callsign}");
         return;
     }
 
@@ -158,15 +172,11 @@ fn handle_command(
             }
         }
     };
-    let accepted = input.inject_answer(index);
-    if accepted {
-        log::info!(
-            "HIL ACK answer={} question={} callsign={}",
-            index,
-            task.question.id,
-            callsign
-        );
-    } else {
-        log::warn!("HIL REJECT input-busy");
-    }
+    input.show(UiRequest::InjectAnswer(index));
+    log::info!(
+        "HIL ACK answer={} question={} callsign={}",
+        index,
+        task.question.id,
+        callsign
+    );
 }

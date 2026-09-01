@@ -63,6 +63,25 @@ pub const fn answer_gesture(index: u8) -> Option<[Buttons; 2]> {
     Some([pressed, released])
 }
 
+/// Frames that hold both side buttons long enough to read as a crash, then
+/// let go.
+///
+/// The hold is timed against a real clock inside [`ButtonState`], so the
+/// caller sizes this from its own sampling period rather than a frame count
+/// meaning anything on its own.
+#[must_use]
+pub fn crash_gesture(hold_frames: usize) -> Vec<Buttons> {
+    let both = Buttons {
+        up: false,
+        right: true,
+        down: false,
+        left: true,
+    };
+    let mut frames = vec![both; hold_frames];
+    frames.push(Buttons::default());
+    frames
+}
+
 /// What the badge decided a gesture meant.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Choice {
@@ -145,7 +164,11 @@ impl ButtonState {
                 _ => now,
             };
             if now.duration_since(since) >= panic_hold {
-                return (Self::Idle, Some(Choice::Panic));
+                // Suppressed, not idle: one hold is one crash. Returning to
+                // idle re-armed the combo under a thumb that never came up,
+                // so a two-second hold fired four crashes, and the release
+                // afterwards could still answer the question.
+                return (Self::SuppressedUntilRelease, Some(Choice::Panic));
             }
             return (Self::Combo { since }, None);
         }
@@ -239,6 +262,44 @@ mod tests {
         assert_eq!(run(&[(LEFT, false)]).1, [], "still held, still silent");
         assert_eq!(run(&[(LEFT, false), (NONE, false)]).1, [Choice::Answer(2)]);
         assert_eq!(run(&[(RIGHT, false), (NONE, false)]).1, [Choice::Answer(1)]);
+    }
+
+    #[test]
+    fn the_injected_crash_gesture_reads_as_a_crash() {
+        // The USB harness has to be able to reach the one path a person can
+        // only exercise with two thumbs, and it must produce a panic rather
+        // than an answer from either side button.
+        // 20 ms per tick here, so 26 frames clears the 500 ms threshold.
+        let frames = crash_gesture(26);
+        let samples: Vec<_> = frames.iter().map(|buttons| (*buttons, false)).collect();
+        assert_eq!(run(&samples).1, [Choice::Panic]);
+    }
+
+    #[test]
+    fn one_hold_is_one_crash_however_long_it_lasts() {
+        // Held for two and a half seconds against a 500 ms threshold. The
+        // player made one gesture and Temporal must be told about one crash.
+        let samples: Vec<_> = crash_gesture(125)
+            .iter()
+            .map(|buttons| (*buttons, false))
+            .collect();
+        let (state, choices) = run(&samples);
+        assert_eq!(choices, [Choice::Panic]);
+        assert_eq!(state, ButtonState::Idle, "released, so back in play");
+    }
+
+    #[test]
+    fn too_short_an_injected_hold_is_not_a_crash() {
+        // 20 ms per tick in `run`, so five frames is 100 ms against a 500 ms
+        // threshold. Releasing early must answer nothing at all.
+        assert_eq!(
+            run(&crash_gesture(5)
+                .iter()
+                .map(|buttons| (*buttons, false))
+                .collect::<Vec<_>>())
+            .1,
+            []
+        );
     }
 
     #[test]
