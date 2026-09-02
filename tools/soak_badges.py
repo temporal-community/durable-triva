@@ -167,6 +167,7 @@ def run_soak(
     print(f"decoding against a snapshot of {source} -> {elf}", flush=True)
 
     completed = 0
+    aborted: Exception | None = None
     try:
         for badge in badges:
             badge.open()
@@ -209,6 +210,10 @@ def run_soak(
                 time.sleep(1.0)
                 for badge in badges:
                     badge.check_alive()
+    except (RuntimeError, TypeError, TimeoutError, OSError) as error:
+        # Stop the run, but never at the cost of the report.
+        aborted = error
+        print(f"\nsoak stopped early: {error}", flush=True)
     finally:
         for badge in badges:
             badge.close()
@@ -218,11 +223,16 @@ def run_soak(
         decode_backtrace(fault, elf)
 
     print("\n" + "=" * 72)
+    if aborted is not None:
+        print(f"run incomplete   : {aborted}")
     print(f"rounds completed : {completed}/{rounds}")
     for badge in badges:
         print(f"{badge.name:<16} boots={badge.boots}  faults={len(badge.faults)}")
     print(f"serial log       : {log}")
     if not faults:
+        if aborted is not None:
+            print("INCONCLUSIVE: no firmware faults, but the run did not finish")
+            return 2
         print("PASS: no firmware faults observed")
         return 0
     print(f"\nFAIL: {len(faults)} fault(s)")

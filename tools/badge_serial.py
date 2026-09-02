@@ -259,29 +259,51 @@ class BadgePort:
                 return
 
 
+# The controller turns a transient Temporal call into a 502, so a long soak
+# will meet one eventually. Losing a fourteen-round fault report to a single
+# blip is worse than the blip.
+TRANSIENT_STATUSES = frozenset({429, 500, 502, 503, 504})
+
+
 def request_json(
     controller: str,
     path: str,
     *,
     method: str = "GET",
     payload: dict[str, JsonValue] | None = None,
+    attempts: int = 4,
 ) -> dict[str, JsonValue]:
-    """Call one controller JSON endpoint and validate its top-level shape."""
+    """Call one controller JSON endpoint and validate its top-level shape.
+
+    Retries transient failures. A 409 is not transient -- it is the controller
+    saying a round is already running -- so it is raised on the first try.
+    """
     body = json.dumps(payload).encode() if payload is not None else None
-    request = Request(
-        f"{controller.rstrip('/')}{path}",
-        data=body,
-        method=method,
-        headers={"Content-Type": "application/json"},
-    )
-    try:
-        with urlopen(request, timeout=15) as response:
-            decoded: object = json.loads(response.read())
-    except (HTTPError, URLError, TimeoutError) as error:
-        raise RuntimeError(f"controller request failed: {error}") from error
-    if not isinstance(decoded, dict):
-        raise TypeError("controller returned a non-object JSON response")
-    return cast(dict[str, JsonValue], decoded)
+    last: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        request = Request(
+            f"{controller.rstrip('/')}{path}",
+            data=body,
+            method=method,
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            with urlopen(request, timeout=15) as response:
+                decoded: object = json.loads(response.read())
+        except HTTPError as error:
+            last = error
+            if error.code not in TRANSIENT_STATUSES:
+                break
+        except (URLError, TimeoutError) as error:
+            last = error
+        else:
+            if not isinstance(decoded, dict):
+                raise TypeError("controller returned a non-object JSON response")
+            return cast(dict[str, JsonValue], decoded)
+        if attempt < attempts:
+            print(f"controller {path} failed ({last}); retrying", flush=True)
+            time.sleep(2.0 * attempt)
+    raise RuntimeError(f"controller request failed: {last}") from last
 
 
 def listed_badges(controller: str) -> set[str]:

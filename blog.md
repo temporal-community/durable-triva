@@ -1,5 +1,57 @@
 # Engineering journal
 
+## 2026-09-02 — DNS re-resolution found, and a claim withdrawn
+
+- Decoded the badge abort at last. `ConnectionOptions` defaults
+  `dns_load_balancing` to `Some(..)`, which spawns a task that re-resolves DNS
+  every thirty seconds through `tokio::spawn_blocking`. Each cycle wants an OS
+  thread, a FreeRTOS stack has to come from internal DRAM, and the badge runs
+  with single-digit kilobytes of that free once TLS is up. When the spawn
+  fails, tokio panics instead of returning an error, and the badge aborts. The
+  backtrace names it in full: `spawn_dns_reresolution` → `resolve_host` →
+  `to_socket_addrs` → `spawn_blocking` → `panic_fmt`.
+- Disabled it on the badge. That is right on its own merits regardless of the
+  fault: one connection to one endpoint gains nothing from spreading requests
+  across resolved addresses, and `validate_and_get_dns_lb` skips the mechanism
+  entirely for an IP literal anyway.
+- **The commit message for that change overstates it and this entry is the
+  correction.** It calls the DNS default "the fault this project has been
+  chasing". Measured over comparable soaks: 3 faults in 13 rounds with DNS
+  load balancing on, 6 in 14 with it off. The two readable
+  `spawn_dns_reresolution` traces do disappear, so that mode is genuinely
+  gone, but the total fault rate did not improve. At three-versus-six events
+  the difference is not significant in either direction; the honest reading is
+  no measured improvement, and a second fault mode dominates.
+- That second mode is the corrupted-backtrace signature that predates every
+  diagnostic added over these two days, and turning the watchpoint off did not
+  make it readable — four corrupted traces in the latest run. It is still open.
+- Three of this project's own diagnostics were obstructing the investigation,
+  which is the more useful lesson. `CONFIG_FREERTOS_WATCHPOINT_END_OF_STACK`
+  traps at the stack boundary as an anonymous debug exception before the canary
+  that would print a task name, so every fault arrived unnamed; it is off now
+  and the DNS trace appeared on the first fault afterwards. The panic hook
+  called `log::error!` and a heap-allocating task sweep, so it aborted inside
+  itself and printed nothing. The first task sweep put a 32-entry array and a
+  `Vec` of formatted names on the caller's stack, cost 7 KiB, and left the UI
+  thread it was measuring with 876 bytes of headroom.
+- Ruled out by measurement rather than argument, and each was a symptom rather
+  than a cause: stack overflow in the three threads this firmware creates
+  (headroom never came close), a leaking blocking pool (the count spikes to
+  eight at connect and returns to four), and a failed Rust allocation (an
+  allocation reporter that cannot itself allocate never fired once).
+- Four attempted memory fixes were reverted, and rounds completed per build is
+  the only measure that held up: 13 and 3 for the baselines, then 0 for a
+  pthread default of 8192, 0 for a blocking pool capped at two and again at
+  four, and 0 with the task stacks trimmed to 48/8/8 KiB. Raising stacks spends
+  the internal DRAM the TLS handshake needs; lowering
+  `CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL` puts task stacks in PSRAM, where a
+  badge died with its stack pointer at `0x3c811e50`. A high-water mark says
+  what a thread has used, not what it needs.
+- The soak harness lost a fourteen-round fault report to a single HTTP 502
+  from `/api/badges`, which is the controller turning a transient Temporal call
+  into a hard error. Transient controller failures now retry, and the report
+  prints even when the run stops early, because the report is the product.
+
 ## 2026-09-01 — Phone path removed and the review findings fixed
 
 - A full-project review at `b0979d6` found a P0 in the public phone service:
