@@ -56,3 +56,26 @@ macros expand to paths rooted at `::temporalio_workflow`. Removing it broke both
 crates immediately; it is restored in `web/Cargo.toml` and `firmware/Cargo.toml`
 with a comment so nobody deletes it again. `qrcode` and `reqwest` were genuinely
 unused once the phone binaries were gone and stay removed.
+
+## Demo readiness — 2026-09-02
+
+Both badges run the default image and were measured over 20 rounds with no
+serial port held open. Six rounds saw a badge drop and rejoin unattended; one
+produced a genuine heartbeat timeout and reassignment. No badge failed
+permanently or needed a power cycle.
+
+The residual fault is a bare `BREAK` with a corrupted backtrace, no panic
+message, no allocation failure, and no `abort()` line. It is not a Rust panic
+(the allocation-free panic hook never fires), not a Rust allocation failure
+(the allocation reporter never fires), not stack overflow in our threads
+(measured headroom: UI 11.7K of 16K, main 40K of 64K), not a blocking-thread
+leak, not USB Serial/JTAG, and not one bad board. The single fully decoded
+instance was newlib `lock_init_generic` failing to create a mutex and calling
+`abort()` — a C-side allocation Rust's hooks cannot observe, consistent with
+internal-DRAM pressure.
+
+It is bounded rather than fixed: cost is under one round of absence, it is
+visible on the OLED while it recovers, and a mid-question drop is what the
+Workflow reassignment path exists for. Starting a round while a badge is still
+booting is the only operator-facing consequence, and `README.md` documents
+waiting for the attract roster.

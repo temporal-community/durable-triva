@@ -1217,3 +1217,41 @@
   play. Raven and Seal both logged their five-second result hold and return to
   waiting. This completes the requested final human switch check; optical OLED
   inspection, haptic feel, and sleep/wake remain separate hands-on boundaries.
+
+## 2026-09-02 — Demo acceptance on the shipped image, and two dead hypotheses
+
+- Flashed both badges with the **default** image (`47047fd`, `verified no HIL
+  test protocol in the image`) and measured 20 rounds through the controller
+  API with **no serial port open anywhere** — the condition an actual demo runs
+  in. Six rounds saw a badge drop and rejoin; one of those produced a real
+  heartbeat timeout and a real reassignment. Zero badges failed permanently,
+  and the roster ended every run with both callsigns.
+- **The USB Serial/JTAG hypothesis is dead.** The fault rate with no host
+  attached (~0.3 per round) is indistinguishable from the ~0.2–0.4 per round
+  measured while the harness held both ports open and wrote constantly. Holding
+  the console open was never the trigger, and a demo badge with nothing plugged
+  into it is not thereby safer.
+- **The per-board hypothesis is also dead.** The first six rounds dropped
+  Raven twice and Seal never, which looked like a flaky board; the next
+  fourteen dropped Seal three times and Raven never. Three each across twenty
+  rounds. It is not one badge.
+- What the fault actually costs is now bounded, which is what demo-readiness
+  turns on: a badge is absent for less than one round, walks its
+  `Booting -> ConnectingWifi -> SyncingTime -> ConnectingCloud` screens on the
+  way back so the drop is visible rather than silent, and rejoins on its own.
+  When it happens mid-question the Workflow reassigns the question — round 3 of
+  fourteen is that path executing unattended.
+- The operator-visible mitigation is a wait, not a fix: the round is sized from
+  Temporal's poller list at the instant it starts, so a badge still booting is
+  dealt nothing and sits out the whole round. `README.md` now says to wait for
+  the attract roster to list every badge before starting, and the roster is
+  served from `GET /api/badges`.
+- Verified the TV surface by eye for the first time at 1280x720: header,
+  per-badge score rows, the durable event feed, and the round-closed panel all
+  render correctly. An earlier scaled screen capture appeared to show the
+  winner name overlapping the header; the DOM geometry disproved it (header
+  49–71 px, rows at 224 and 513), and it was an artifact of capturing mid
+  transition.
+- Not validated, and still needing hands: button answering on the shipped
+  image (the demo image deliberately has no inject path, so scored answers
+  need real fingers), optical OLED inspection, haptic feel, and sleep/wake.

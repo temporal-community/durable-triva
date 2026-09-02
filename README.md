@@ -83,6 +83,36 @@ Open **http://127.0.0.1:3000**, mirror it to the TV, and select **Start Round**.
 To use physical hardware, continue with the
 [badge firmware guide](firmware/README.md).
 
+## Running the demo on hardware
+
+Flash the **default** image. `./build-firmware.sh` with no arguments builds it
+and prints `verified no HIL test protocol in the image`; the `hil` feature adds
+a USB command channel that can inject answers and crashes, and it has no place
+on a badge you hand to someone.
+
+```sh
+./build-firmware.sh
+./flash-badge.sh /dev/cu.usbmodemXXXXXXX
+```
+
+Then, per demo:
+
+1. Start the controller with `./run-web.sh` and open
+   **http://127.0.0.1:3000**.
+2. **Wait for the attract screen to list every badge you intend to play
+   before selecting Start Round.** The round is sized from Temporal's poller
+   list at the moment it starts, so a badge that is still booting is not dealt
+   a question and sits out the whole round. The roster refreshes every two
+   seconds and is also available at `GET /api/badges`.
+3. A badge takes roughly ten seconds from power-on to `Polling trivia queue`,
+   walking `Booting -> ConnectingWifi -> SyncingTime -> ConnectingCloud`
+   on its OLED, so a reboot is visible rather than silent.
+
+If a badge reboots mid-round the Workflow is designed for it: the Activity
+heartbeat lapses, the question is reassigned to another badge, and the
+recovered badge rejoins and is dealt new work. That path is the demo, not a
+failure of it.
+
 ## Common checks
 
 Run the host-side checks -- fmt, clippy and the full test suite for `web`,
