@@ -98,12 +98,15 @@ const RESTART_BACKOFF: Duration = Duration::from_secs(2);
 /// How long a badge waits before failing an Activity for a question it has
 /// already abandoned, so the retry has a moment to reach a different Worker.
 const ABANDONED_REFUSAL_BACKOFF: Duration = Duration::from_millis(250);
-/// How often to report an input path that has produced nothing.
+/// How often the acceptance image reports an input path that has produced
+/// nothing. Ten seconds, not two: it fires while a question waits, which
+/// during human-paced play is most of the time.
+#[cfg(feature = "hil")]
 ///
 /// A badge that silently ignores every press looks identical to one that is
 /// waiting for one. `SuppressedUntilRelease` and a stuck `powerup_active` both
 /// do exactly that, for the whole life of a question, and neither said a word.
-const INPUT_DIAGNOSTIC_INTERVAL: Duration = Duration::from_millis(2_000);
+const INPUT_DIAGNOSTIC_INTERVAL: Duration = Duration::from_secs(10);
 
 #[cfg(feature = "hil")]
 type SharedQuestion = Arc<Mutex<Option<QuestionTask>>>;
@@ -433,8 +436,11 @@ impl BadgeActivities {
         let local_deadline = Instant::now() + MAX_ACTIVITY_RUNTIME;
         // Anything the sampler recognised before this question opened was
         // aimed at the previous screen.
+        #[cfg(feature = "hil")]
         let opened_at = Instant::now();
+        #[cfg(feature = "hil")]
         let mut last_diagnostic = Instant::now();
+        #[cfg(feature = "hil")]
         let opening_ticks = self.ui.ticks();
         loop {
             if ctx.is_cancelled() {
@@ -480,6 +486,7 @@ impl BadgeActivities {
             // The sampler's tick count is the honest health signal now: this
             // loop being slow only delays an answer, but the sampler stalling
             // would lose one.
+            #[cfg(feature = "hil")]
             if last_diagnostic.elapsed() >= INPUT_DIAGNOSTIC_INTERVAL {
                 last_diagnostic = Instant::now();
                 log::warn!(
@@ -1038,27 +1045,56 @@ fn install_allocation_reporter() {
 
 /// Reports a Rust panic before the process aborts.
 ///
-/// Every badge fault so far has been a `BREAK` followed by a double exception
-/// in the handler itself, which loses the message and the backtrace with it.
-/// A panic hook runs first, while the stack is still whatever the panicking
-/// code left, and `log::error!` reaches the UART without waiting for a
-/// handler that may not survive. If a fault prints nothing from here, it was
-/// never a Rust panic and the search moves to ESP-IDF.
+/// Nothing here allocates or takes a lock. The previous version called
+/// `log::error!` and a heap-allocating task sweep, so a panic under memory
+/// pressure panicked again inside the hook and aborted with nothing printed --
+/// which is exactly the anonymous `BREAK` this firmware kept dying on.
+/// `esp_rom_printf` writes to the UART from ROM and asks nothing of the
+/// runtime that has just failed.
 fn install_panic_reporter() {
     std::panic::set_hook(Box::new(|info| {
-        let location = info
-            .location()
-            .map_or_else(|| "unknown".to_owned(), ToString::to_string);
-        log::error!(
-            "RUST PANIC at {location}: {}",
-            info.payload_as_str().unwrap_or("<no message>")
-        );
-        log::error!(
-            "panicking task stack headroom: {} bytes",
-            ui::stack_headroom()
-        );
-        ui::log_every_task_stack();
+        report("PANIC file", info.location().map_or("?", |at| at.file()));
+        let line = info.location().map_or(0, std::panic::Location::line);
+        let message = info.payload_as_str().unwrap_or("<no message>");
+        report("PANIC msg", message);
+        // SAFETY: a variadic ROM printf against a NUL-terminated literal and
+        // four integers matching its conversions. Allocation- and lock-free.
+        unsafe {
+            esp_idf_svc::sys::esp_rom_printf(
+                c"PANIC line=%u internal_free=%u internal_low=%u total_free=%u\n".as_ptr(),
+                line,
+                free_heap(),
+                lowest_heap(),
+                total_free_heap(),
+            );
+        }
     }));
+}
+
+/// Prints one label and string to the UART without allocating.
+///
+/// Copies through a fixed stack buffer because `esp_rom_printf` needs a
+/// NUL-terminated pointer and a Rust `&str` is neither NUL-terminated nor
+/// something we may reallocate at this point. Long values are truncated; a
+/// truncated file name still names the file.
+fn report(label: &str, value: &str) {
+    const MAX: usize = 96;
+    let mut label_buf = [0_u8; 32];
+    let mut value_buf = [0_u8; MAX + 1];
+    let label_len = label.len().min(label_buf.len() - 1);
+    label_buf[..label_len].copy_from_slice(&label.as_bytes()[..label_len]);
+    let value_len = value.len().min(MAX);
+    value_buf[..value_len].copy_from_slice(&value.as_bytes()[..value_len]);
+    // SAFETY: both buffers are NUL-terminated by construction -- they are
+    // zeroed and never filled to their final byte -- and stay alive for the
+    // duration of the call. The format string's two %s match two pointers.
+    unsafe {
+        esp_idf_svc::sys::esp_rom_printf(
+            c"%s: %s\n".as_ptr(),
+            label_buf.as_ptr(),
+            value_buf.as_ptr(),
+        );
+    }
 }
 
 fn validate_config() -> Result<()> {

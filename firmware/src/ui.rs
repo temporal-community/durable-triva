@@ -53,15 +53,21 @@ const MAX_QUEUED_CHOICES: usize = 8;
 const POWERUP_OVERLAY: Duration = Duration::from_millis(1_500);
 const SLEEP_ARM_DELAY: Duration = Duration::from_millis(250);
 const SLEEP_HOLD: Duration = Duration::from_secs(3);
-/// How often to report this thread's worst-case stack headroom.
+/// How often the acceptance image reports every task's stack headroom.
+///
+/// Two minutes, not fifteen seconds. This sweep allocates and prints fourteen
+/// lines per badge, and the fault it helps investigate is the badge running
+/// out of memory -- so a soak that hammers it is measuring the wrong firmware.
+#[cfg(feature = "hil")]
 ///
 /// Every panic so far has been a double exception, which on Xtensa means a
 /// fault inside the exception handler and almost always a stack that ran out.
 /// The backtrace is destroyed by definition in that case, so the honest way
 /// to find it is to watch the headroom rather than the wreckage.
-const STACK_REPORT_INTERVAL: Duration = Duration::from_secs(15);
+const STACK_REPORT_INTERVAL: Duration = Duration::from_secs(120);
 
 /// Bytes of stack this task has never used, at its worst moment so far.
+#[cfg(feature = "hil")]
 pub fn stack_headroom() -> u32 {
     // SAFETY: a read of the current task's own FreeRTOS bookkeeping, with the
     // null handle meaning "me", which is always valid from a running task.
@@ -70,12 +76,16 @@ pub fn stack_headroom() -> u32 {
 
 /// Reports the worst-case stack headroom of every task in the system.
 ///
+/// Acceptance builds only: it allocates, which is the last thing a badge that
+/// is short of memory should be asked to do on a schedule.
+///
 /// The three this firmware creates are not the only ones that can overflow,
 /// and the canary fires on whichever does, so a full sweep is the only way to
 /// know. Everything here is deliberately kept off the caller's stack: the
 /// first version put a 32-entry status array and a Vec of formatted names on
 /// it, cost 7 KiB, and left the UI thread it was measuring with 876 bytes --
 /// a measurement that endangers its subject measures nothing.
+#[cfg(feature = "hil")]
 pub fn log_every_task_stack() {
     const MAX_TASKS: usize = 24;
     // SAFETY: FreeRTOS fills at most `MAX_TASKS` entries of a heap buffer we
@@ -158,6 +168,7 @@ impl Ui {
     }
 
     /// UI loop turns since boot. Compare two readings to prove it is alive.
+    #[cfg(feature = "hil")]
     pub fn ticks(&self) -> u32 {
         self.shared.ticks.load(Ordering::Acquire)
     }
@@ -286,6 +297,7 @@ pub fn start(
                 injected: VecDeque::new(),
                 down_since: None,
                 countdown_shown: None,
+                #[cfg(feature = "hil")]
                 last_stack_report: Instant::now(),
             };
             state.run(&inbox);
@@ -308,6 +320,7 @@ struct UiThread {
     injected: VecDeque<Buttons>,
     down_since: Option<Instant>,
     countdown_shown: Option<u64>,
+    #[cfg(feature = "hil")]
     last_stack_report: Instant,
 }
 
@@ -330,6 +343,7 @@ impl UiThread {
             let buttons = self.sample();
             self.advance_buttons(buttons, now);
             self.advance_sleep(buttons, now);
+            #[cfg(feature = "hil")]
             if self.last_stack_report.elapsed() >= STACK_REPORT_INTERVAL {
                 self.last_stack_report = now;
                 log_every_task_stack();
