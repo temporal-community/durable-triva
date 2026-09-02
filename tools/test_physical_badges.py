@@ -6,222 +6,30 @@
 # ]
 # ///
 
-"""Run a two-badge hardware-in-the-loop Temporal trivia acceptance test."""
+"""Run a two-badge hardware-in-the-loop Temporal trivia acceptance test.
+
+Proves one good round end to end: both real badge Workers holding questions at
+the same moment, one correct answer each through the same input state machine
+the face buttons drive, and both boards back on the waiting screen afterwards.
+
+Needs badges flashed with `./build-firmware.sh --features hil`. For a long
+adversarial run instead of a single clean one, see `soak_badges.py`.
+"""
 
 from __future__ import annotations
 
 import argparse
-import json
 import re
-import threading
 import time
-from collections import deque
-from dataclasses import dataclass, field
-from glob import glob
-from typing import TypeAlias, cast
-from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from typing import cast
 
-import serial
-
-JsonValue: TypeAlias = (
-    None | bool | int | float | str | list["JsonValue"] | dict[str, "JsonValue"]
+from badge_serial import (
+    BadgePort,
+    JsonValue,
+    discover_ports,
+    request_json,
+    wait_for_scheduler_roster,
 )
-
-
-@dataclass
-class BadgePort:
-    """Own one physical badge serial connection and its captured log lines."""
-
-    path: str
-    connection: serial.Serial = field(init=False)
-    callsign: str | None = field(default=None, init=False)
-    _lines: deque[tuple[int, str]] = field(
-        default_factory=lambda: deque(maxlen=4_000), init=False
-    )
-    _sequence: int = field(default=0, init=False)
-    _condition: threading.Condition = field(
-        default_factory=threading.Condition, init=False
-    )
-    _stop: threading.Event = field(default_factory=threading.Event, init=False)
-    _reader: threading.Thread = field(init=False)
-
-    def open(self) -> None:
-        """Open without intentionally toggling reset and begin capturing logs."""
-        connection = serial.Serial()
-        connection.port = self.path
-        connection.baudrate = 115_200
-        connection.timeout = 0.2
-        connection.write_timeout = 1.0
-        connection.dtr = False
-        connection.rts = False
-        connection.exclusive = True
-        connection.open()
-        self.connection = connection
-        self._reader = threading.Thread(
-            target=self._read_lines,
-            name=f"serial-{self.path.rsplit('/', maxsplit=1)[-1]}",
-            daemon=True,
-        )
-        self._reader.start()
-
-    def close(self) -> None:
-        """Stop capture and release the serial device."""
-        self._stop.set()
-        if hasattr(self, "connection"):
-            self.connection.close()
-        if hasattr(self, "_reader"):
-            self._reader.join(timeout=1.0)
-
-    def mark(self) -> int:
-        """Return the current log sequence for later scoped waits."""
-        with self._condition:
-            return self._sequence
-
-    def send(self, command: str) -> None:
-        """Send one newline-terminated HIL command."""
-        self.connection.write(f"{command}\n".encode())
-        self.connection.flush()
-
-    def wait_for(self, pattern: str, timeout: float, *, after: int = 0) -> str:
-        """Wait for a matching serial line newer than ``after``."""
-        matcher = re.compile(pattern)
-        deadline = time.monotonic() + timeout
-        with self._condition:
-            while True:
-                for sequence, line in self._lines:
-                    if sequence > after and matcher.search(line):
-                        return line
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise TimeoutError(
-                        f"{self.callsign or self.path}: no serial match for {pattern!r}"
-                    )
-                self._condition.wait(timeout=min(remaining, 0.5))
-
-    def status(self, timeout: float) -> re.Match[str]:
-        """Ask firmware for one fresh HIL STATUS line and return its fields."""
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            marker = self.mark()
-            self.send("HIL STATUS")
-            try:
-                line = self.wait_for(r"HIL STATUS callsign=", 1.0, after=marker)
-            except TimeoutError:
-                continue
-            match = re.search(
-                r"callsign=(?P<callsign>[^ ]+) polling=(?P<polling>\S+) "
-                r"active=(?P<active>\S+) question=(?P<question>\S+)",
-                line,
-            )
-            if match is not None:
-                self.callsign = match.group("callsign")
-                return match
-        raise TimeoutError(f"{self.path}: badge did not answer HIL STATUS")
-
-    def identify(self, timeout: float) -> str:
-        """Ask firmware for its stable callsign and return it."""
-        return cast(str, self.status(timeout).group("callsign"))
-
-    def await_polling(self, timeout: float) -> None:
-        """Block until this badge's Temporal Worker reports that it is polling.
-
-        Readiness is asked for rather than inferred from the boot log: that
-        line is printed once, and the runner deliberately opens the port
-        without toggling reset, so on a badge that was already running it has
-        long since scrolled past.
-        """
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            if self.status(min(5.0, timeout)).group("polling") == "true":
-                return
-            time.sleep(0.25)
-        raise TimeoutError(
-            f"{self.callsign or self.path}: Worker never reported polling"
-        )
-
-    def owns_question(self) -> bool:
-        """Whether this badge is holding a question right now."""
-        return self.status(5.0).group("active") == "true"
-
-    def _read_lines(self) -> None:
-        while not self._stop.is_set():
-            try:
-                raw_line = self.connection.readline()
-            except (OSError, serial.SerialException):
-                if not self._stop.is_set():
-                    time.sleep(0.1)
-                continue
-            if not raw_line:
-                continue
-            line = raw_line.decode(errors="replace").strip()
-            if not line:
-                continue
-            with self._condition:
-                self._sequence += 1
-                self._lines.append((self._sequence, line))
-                self._condition.notify_all()
-            print(f"[{self.callsign or self.path}] {line}")
-
-
-def request_json(
-    controller: str,
-    path: str,
-    *,
-    method: str = "GET",
-    payload: dict[str, JsonValue] | None = None,
-) -> dict[str, JsonValue]:
-    """Call one controller JSON endpoint and validate its top-level shape."""
-    body = json.dumps(payload).encode() if payload is not None else None
-    request = Request(
-        f"{controller.rstrip('/')}{path}",
-        data=body,
-        method=method,
-        headers={"Content-Type": "application/json"},
-    )
-    try:
-        with urlopen(request, timeout=10) as response:
-            decoded: object = json.loads(response.read())
-    except (HTTPError, URLError) as error:
-        raise RuntimeError(f"controller request failed: {error}") from error
-    if not isinstance(decoded, dict):
-        raise TypeError("controller returned a non-object JSON response")
-    return cast(dict[str, JsonValue], decoded)
-
-
-def discover_ports(explicit_ports: list[str]) -> list[str]:
-    """Return exactly two distinct USB modem device paths."""
-    ports = explicit_ports or sorted(glob("/dev/cu.usbmodem*"))
-    if len(ports) != 2 or len(set(ports)) != 2:
-        raise RuntimeError(
-            f"expected exactly two distinct badge ports, found {len(ports)}: {ports}"
-        )
-    return ports
-
-
-def wait_for_scheduler_roster(
-    controller: str, callsigns: list[str], timeout: float
-) -> None:
-    """Wait until the controller lists both callsigns as polling Workers.
-
-    A badge reporting ``polling=true`` has only started its Worker task. The
-    round is sized from Temporal's own poller list, which lags behind that by
-    a few seconds -- so starting on the firmware flag alone produces a round
-    that schedules nothing, or schedules for one badge out of two.
-    """
-    deadline = time.monotonic() + timeout
-    wanted = set(callsigns)
-    seen: set[str] = set()
-    while time.monotonic() < deadline:
-        roster = request_json(controller, "/api/badges")
-        listed = roster.get("callsigns")
-        seen = set(listed) if isinstance(listed, list) else set()
-        if wanted <= seen:
-            return
-        time.sleep(0.5)
-    raise TimeoutError(
-        f"controller never listed both badges as polling: wanted {sorted(wanted)}, saw {sorted(seen)}"
-    )
 
 
 def player_correct_count(state: dict[str, JsonValue], callsign: str) -> int:
@@ -252,13 +60,12 @@ def wait_for_controller_result(
     raise TimeoutError("controller did not record one correct answer from each badge")
 
 
-def wait_for_finished(controller: str, timeout: float) -> dict[str, JsonValue]:
+def wait_for_finished(controller: str, timeout: float) -> None:
     """Wait for the hardware round to reach its final Workflow state."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        state = request_json(controller, "/api/state")
-        if state.get("status") == "finished":
-            return state
+        if request_json(controller, "/api/state").get("status") == "finished":
+            return
         time.sleep(0.5)
     raise TimeoutError("physical badge round did not finish")
 
@@ -270,17 +77,18 @@ def run_test(
     backlog_override: int | None,
 ) -> None:
     """Run one correct-answer round through both real badge Workers."""
-    badges = [BadgePort(path) for path in ports]
+    badges = [BadgePort(path=path) for path in ports]
     try:
         for badge in badges:
-            badge.open()
+            badge.open(echo=True)
         callsigns = [badge.identify(timeout) for badge in badges]
         if len(set(callsigns)) != 2:
             raise RuntimeError(f"badge callsigns are not unique: {callsigns}")
         print(f"HIL identified physical badges: {', '.join(callsigns)}")
 
         for badge in badges:
-            badge.await_polling(timeout)
+            if not badge.await_polling(timeout):
+                raise TimeoutError(f"{badge.name}: Worker never reported polling")
         print("HIL both physical badge Workers report polling")
 
         wait_for_scheduler_roster(controller, callsigns, timeout)
@@ -296,11 +104,15 @@ def run_test(
         print(f"HIL started round: {started.get('game_id')}")
 
         for badge in badges:
-            badge.wait_for(
-                r"Question .* preparation complete",
-                timeout,
-                after=markers[badge.path],
-            )
+            if (
+                badge.wait_for(
+                    r"Question .* preparation complete",
+                    timeout,
+                    after=markers[badge.path],
+                )
+                is None
+            ):
+                raise TimeoutError(f"{badge.name}: never received a question")
         # Reaching that log line proves each badge held a question at some
         # point, which two sequential ownerships also satisfy. Simultaneous
         # ownership is the property a one-slot scheduler would fail, so ask
@@ -315,8 +127,9 @@ def run_test(
         for badge in badges:
             marker = badge.mark()
             badge.send("HIL ANSWER CORRECT")
-            badge.wait_for(r"HIL ACK answer=", 5.0, after=marker)
-            badge.wait_for(r"Input selected answer=", 5.0, after=marker)
+            for pattern in (r"HIL ACK answer=", r"Input selected answer="):
+                if badge.wait_for(pattern, 5.0, after=marker) is None:
+                    raise TimeoutError(f"{badge.name}: no {pattern!r} after answering")
 
         state = wait_for_controller_result(controller, callsigns, timeout)
         print(
@@ -329,11 +142,11 @@ def run_test(
 
         wait_for_finished(controller, timeout)
         for badge in badges:
-            badge.wait_for(
-                rf"Result hold complete; {re.escape(cast(str, badge.callsign))} returned to waiting",
-                timeout,
-                after=markers[badge.path],
+            expected = (
+                rf"Result hold complete; {re.escape(badge.name)} returned to waiting"
             )
+            if badge.wait_for(expected, timeout, after=markers[badge.path]) is None:
+                raise TimeoutError(f"{badge.name}: never returned to waiting")
         print("PASS: both physical badges answered correctly and returned to waiting")
     finally:
         for badge in badges:
@@ -353,7 +166,7 @@ def main() -> None:
     )
     arguments = parser.parse_args()
     run_test(
-        discover_ports(cast(list[str], arguments.ports)),
+        discover_ports(cast(list[str], arguments.ports), expected=2),
         cast(str, arguments.controller),
         cast(float, arguments.timeout),
         cast(int | None, arguments.backlog_override),

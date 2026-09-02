@@ -87,6 +87,9 @@ const RESULT_WATCH_POLLS: u32 = 45;
 /// Keep final standings readable, then make an idle badge visibly ready for
 /// the next round instead of leaving stale results on screen.
 const RESULT_HOLD: Duration = Duration::from_secs(5);
+/// Pause before a reboot, so the log drains and a busy access point gets a
+/// moment before the next association attempt.
+const RESTART_BACKOFF: Duration = Duration::from_secs(2);
 /// How long a badge waits before failing an Activity for a question it has
 /// already abandoned, so the retry has a moment to reach a different Worker.
 const ABANDONED_REFUSAL_BACKOFF: Duration = Duration::from_millis(250);
@@ -686,9 +689,31 @@ fn main() -> Result<()> {
     esp_idf_svc::sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
     install_panic_reporter();
+    // A build with no credentials in it will never work, so say so once and
+    // stop rather than rebooting forever over it.
     validate_config()?;
+
+    // Everything after this can fail transiently: an access point that is busy,
+    // a Cloud connection reset, an SNTP server that does not answer. A badge
+    // that exits on any of them sits powered, lit and useless until somebody
+    // unplugs it -- which is precisely how this firmware spent an evening
+    // looking frozen, once as a stopped Worker and once as a failed Wi-Fi join.
+    // The next boot is a fresh attempt at all of it, and a badge that keeps
+    // retrying is the only behaviour a booth can use.
+    if let Err(error) = boot() {
+        log::error!("badge boot failed: {error:#}");
+    }
+    restart()
+}
+
+/// Brings the badge up and runs it. Only returns if something went wrong.
+fn boot() -> Result<()> {
     let identity = factory_identity()?;
     log::info!("Temporal Trivia badge booting as {}", identity.callsign);
+    // Internal DRAM is the scarce resource on this chip and the one TLS needs.
+    // Print it before anything has been allocated, so a build that starves the
+    // handshake is obvious from the first lines of a boot log.
+    log::info!("free internal DRAM at boot: {} bytes", free_heap());
 
     let peripherals = Peripherals::take().context("take ESP32 peripherals")?;
     let display = BadgeDisplay::new(
@@ -748,9 +773,14 @@ fn main() -> Result<()> {
         // and a FreeRTOS task stack has to come from internal DRAM, of which
         // this chip has about 512 KiB no matter how much PSRAM is fitted.
         // Exhausting it makes newlib's lock_init_generic fail to allocate a
-        // semaphore and abort(), which is the fault this firmware spent an
-        // evening chasing. Two is more than the badge ever needs at once.
-        .max_blocking_threads(2)
+        // semaphore and abort().
+        //
+        // Bounded, not starved. Two was tried and is too few: DNS and the
+        // SDK's own blocking work could not both get a thread, so the Cloud
+        // connection never finished establishing and the badge never reached
+        // `Polling trivia queue` at all. Four costs at most 32 KiB and leaves
+        // room for both.
+        .max_blocking_threads(4)
         // Keep those two rather than paying to recreate them every reconnect.
         .thread_keep_alive(Duration::from_secs(600))
         .build()
@@ -858,8 +888,11 @@ async fn run_worker(ui: Ui, identity: BadgeIdentity, session: Arc<SessionStore>)
 
 /// Reboots the badge. Never returns.
 fn restart() -> ! {
-    // Give the log a moment to drain before the reset takes the UART with it.
-    std::thread::sleep(Duration::from_millis(250));
+    // Long enough for the log to drain before the reset takes the UART, and
+    // long enough not to hammer an access point that is already refusing us:
+    // a tight reboot loop over a failed Wi-Fi join makes the next attempt
+    // less likely to succeed, not more.
+    std::thread::sleep(RESTART_BACKOFF);
     // SAFETY: an unconditional ESP-IDF reset with no arguments and no state.
     unsafe { esp_idf_svc::sys::esp_restart() }
 }

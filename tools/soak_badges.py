@@ -9,11 +9,11 @@
 """Soak two physical badges over USB and hunt for firmware faults.
 
 `test_physical_badges.py` proves one good round. This plays badly on purpose,
-for as long as you let it: answers the instant a question appears, injects the
-crash gesture, and sits idle between rounds -- the three windows every fault
-seen so far has appeared in. It watches the serial streams for panics, reboots
-and silence, decodes any backtrace against the flashed ELF, and keeps going so
-a fault that needs twenty rounds to show up still gets found.
+for as long as you let it: answers at human pace, injects the crash gesture,
+and sits idle between rounds -- the three windows every fault found so far has
+appeared in. It watches both serial streams for panics, aborts, reboots and
+silence, decodes any backtrace against a snapshot of the flashed ELF, and
+keeps going, so a fault that needs twenty rounds to surface still gets found.
 
 Needs badges flashed with `./build-firmware.sh --features hil`.
 """
@@ -21,28 +21,27 @@ Needs badges flashed with `./build-firmware.sh --features hil`.
 from __future__ import annotations
 
 import argparse
-import json
 import random
 import re
 import subprocess
-import threading
 import time
-from collections import deque
-from dataclasses import dataclass, field
-from glob import glob
 from pathlib import Path
-from typing import TypeAlias, cast
-from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from typing import cast
 
-import serial
-
-JsonValue: TypeAlias = (
-    None | bool | int | float | str | list["JsonValue"] | dict[str, "JsonValue"]
+from badge_serial import (
+    BadgePort,
+    Fault,
+    discover_ports,
+    game_status,
+    listed_badges,
+    request_json,
+    wait_for_status,
 )
 
 FIRMWARE_ELF = "target/xtensa-esp32s3-espidf/release/temporal-trivia-badge-firmware"
-# Any of these means the firmware stopped being the firmware.
+# Any of these means the firmware stopped being the firmware. The trailing
+# reset pattern deliberately excludes USB_UART_CHIP_RESET, which is just a
+# host opening the port.
 FAULT_PATTERNS = (
     r"Guru Meditation",
     r"Debug exception reason",
@@ -53,215 +52,21 @@ FAULT_PATTERNS = (
     r"Brownout",
     r"rst:0x[0-9a-f]+ \((?!USB_UART_CHIP_RESET)",
 )
-# A badge whose Worker exits stops saying anything at all, and until this was
-# a fault the soak sat waiting on it for ten minutes and reported nothing.
+# A badge whose Worker exits stops saying anything at all. Until this counted,
+# the soak sat waiting on a dead board for ten minutes and reported nothing.
 SILENCE_IS_A_FAULT = 90.0
-BOOT_MARKER = "Temporal Trivia badge booting as"
-POLLING_MARKER = "Polling trivia queue"
-
-
-@dataclass
-class Fault:
-    """One thing that went wrong, with whatever context explains it."""
-
-    badge: str
-    kind: str
-    line: str
-    context: list[str]
-    decoded: list[str] = field(default_factory=list)
-
-
-@dataclass
-class BadgePort:
-    """Own one badge's serial connection, its log, and its fault detection."""
-
-    path: str
-    log: Path
-    callsign: str | None = field(default=None, init=False)
-    faults: list[Fault] = field(default_factory=list, init=False)
-    boots: int = field(default=0, init=False)
-    connection: serial.Serial = field(init=False)
-    _lines: deque[tuple[int, str]] = field(
-        default_factory=lambda: deque(maxlen=8_000), init=False
-    )
-    _recent: deque[str] = field(default_factory=lambda: deque(maxlen=40), init=False)
-    _sequence: int = field(default=0, init=False)
-    _condition: threading.Condition = field(
-        default_factory=threading.Condition, init=False
-    )
-    _stop: threading.Event = field(default_factory=threading.Event, init=False)
-    _last_line_at: float = field(default_factory=time.monotonic, init=False)
-    _pending_fault: Fault | None = field(default=None, init=False)
-    _fault_tail: int = field(default=0, init=False)
-    _reported_silence: bool = field(default=False, init=False)
-
-    def open(self) -> None:
-        """Open without intentionally toggling reset and start capturing."""
-        connection = serial.Serial()
-        connection.port = self.path
-        connection.baudrate = 115_200
-        connection.timeout = 0.2
-        connection.write_timeout = 1.0
-        connection.dtr = False
-        connection.rts = False
-        connection.exclusive = True
-        connection.open()
-        self.connection = connection
-        threading.Thread(
-            target=self._read_lines,
-            name=f"soak-{self.path.rsplit('/', maxsplit=1)[-1]}",
-            daemon=True,
-        ).start()
-
-    def close(self) -> None:
-        self._stop.set()
-        if hasattr(self, "connection"):
-            self.connection.close()
-
-    @property
-    def name(self) -> str:
-        return self.callsign or self.path
-
-    def mark(self) -> int:
-        with self._condition:
-            return self._sequence
-
-    def send(self, command: str) -> None:
-        try:
-            self.connection.write(f"{command}\n".encode())
-            self.connection.flush()
-        except (OSError, serial.SerialException) as error:
-            print(f"[{self.name}] serial write failed: {error}")
-
-    def silent_for(self) -> float:
-        """Seconds since this badge last said anything at all."""
-        with self._condition:
-            return time.monotonic() - self._last_line_at
-
-    def check_alive(self) -> bool:
-        """Record a fault if this badge has gone quiet. True while healthy."""
-        quiet = self.silent_for()
-        if quiet < SILENCE_IS_A_FAULT or self._reported_silence:
-            return quiet < SILENCE_IS_A_FAULT
-        self._reported_silence = True
-        line = f"no serial output for {quiet:.0f}s -- Worker stopped or badge hung"
-        print(f"\n!! [{self.name}] FAULT: {line}", flush=True)
-        with self._condition:
-            self.faults.append(
-                Fault(
-                    badge=self.name,
-                    kind="silence",
-                    line=line,
-                    context=list(self._recent),
-                )
-            )
-        return False
-
-    def wait_for(self, pattern: str, timeout: float, *, after: int = 0) -> str | None:
-        """Wait for a matching line newer than ``after``; None on timeout."""
-        matcher = re.compile(pattern)
-        deadline = time.monotonic() + timeout
-        with self._condition:
-            while True:
-                for sequence, line in self._lines:
-                    if sequence > after and matcher.search(line):
-                        return line
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    return None
-                self._condition.wait(timeout=min(remaining, 0.25))
-
-    def status(self, timeout: float = 4.0) -> re.Match[str] | None:
-        """One fresh HIL STATUS, or None if the badge did not answer.
-
-        The HIL reader only starts once the Worker does, which is after Wi-Fi,
-        SNTP and the Cloud connect -- roughly 25 seconds from reset. Callers
-        identifying a freshly flashed badge need to allow for that.
-        """
-        deadline = time.monotonic() + timeout
-        line = None
-        while line is None and time.monotonic() < deadline:
-            marker = self.mark()
-            self.send("HIL STATUS")
-            line = self.wait_for(r"HIL STATUS callsign=", 2.0, after=marker)
-        if line is None:
-            return None
-        match = re.search(
-            r"callsign=(?P<callsign>\S+) polling=(?P<polling>\S+) "
-            r"active=(?P<active>\S+) question=(?P<question>\S+)",
-            line,
-        )
-        if match is not None:
-            self.callsign = match.group("callsign")
-        return match
-
-    def await_ready(self, timeout: float) -> bool:
-        """Wait until this badge's Worker reports it is polling Temporal."""
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            match = self.status()
-            if match is not None and match.group("polling") == "true":
-                return True
-            time.sleep(0.5)
-        return False
-
-    def _read_lines(self) -> None:
-        with self.log.open("a", encoding="utf-8") as handle:
-            while not self._stop.is_set():
-                try:
-                    raw = self.connection.readline()
-                except (OSError, serial.SerialException):
-                    if not self._stop.is_set():
-                        time.sleep(0.1)
-                    continue
-                if not raw:
-                    continue
-                line = raw.decode(errors="replace").rstrip()
-                if not line:
-                    continue
-                handle.write(f"{time.strftime('%H:%M:%S')} [{self.name}] {line}\n")
-                handle.flush()
-                with self._condition:
-                    self._sequence += 1
-                    self._last_line_at = time.monotonic()
-                    self._reported_silence = False
-                    self._lines.append((self._sequence, line))
-                    self._recent.append(line)
-                    self._note_fault(line)
-                    self._condition.notify_all()
-
-    def _note_fault(self, line: str) -> None:
-        """Detect a fault and keep collecting the lines that explain it."""
-        if self._pending_fault is not None:
-            self._pending_fault.context.append(line)
-            self._fault_tail -= 1
-            if self._fault_tail <= 0:
-                self.faults.append(self._pending_fault)
-                self._pending_fault = None
-            return
-        if BOOT_MARKER in line:
-            self.boots += 1
-        for pattern in FAULT_PATTERNS:
-            if re.search(pattern, line):
-                print(f"\n!! [{self.name}] FAULT: {line}", flush=True)
-                self._pending_fault = Fault(
-                    badge=self.name,
-                    kind=pattern,
-                    line=line,
-                    context=list(self._recent),
-                )
-                # Enough to carry a register dump and a backtrace.
-                self._fault_tail = 28
-                return
+# A person reads the prompt, reads four answers, decides, then presses. Nobody
+# does that in 300 ms, and hammering at machine speed tests a regime the demo
+# never runs in: far more Activities per round than a round can really produce.
+THINK_SECONDS = (1.8, 6.5)
 
 
 def decode_backtrace(fault: Fault, elf: Path) -> None:
     """Turn any captured backtrace addresses into source locations."""
     addresses: list[str] = []
     for line in fault.context:
-        if "Backtrace:" not in line:
-            continue
-        addresses.extend(re.findall(r"0x4[0-9a-f]{7}", line))
+        if "Backtrace:" in line:
+            addresses.extend(re.findall(r"0x4[0-9a-f]{7}", line))
     if not addresses:
         return
     try:
@@ -276,57 +81,6 @@ def decode_backtrace(fault: Fault, elf: Path) -> None:
         fault.decoded = [f"could not decode: {error}"]
         return
     fault.decoded = [line for line in result.stdout.splitlines() if line.strip()]
-
-
-def request_json(
-    controller: str,
-    path: str,
-    *,
-    method: str = "GET",
-    payload: dict[str, JsonValue] | None = None,
-) -> dict[str, JsonValue]:
-    """Call one controller JSON endpoint and validate its top-level shape."""
-    body = json.dumps(payload).encode() if payload is not None else None
-    request = Request(
-        f"{controller.rstrip('/')}{path}",
-        data=body,
-        method=method,
-        headers={"Content-Type": "application/json"},
-    )
-    try:
-        with urlopen(request, timeout=15) as response:
-            decoded: object = json.loads(response.read())
-    except (HTTPError, URLError, TimeoutError) as error:
-        raise RuntimeError(f"controller request failed: {error}") from error
-    if not isinstance(decoded, dict):
-        raise TypeError("controller returned a non-object JSON response")
-    return cast(dict[str, JsonValue], decoded)
-
-
-def listed_badges(controller: str) -> set[str]:
-    roster = request_json(controller, "/api/badges").get("callsigns")
-    return set(roster) if isinstance(roster, list) else set()
-
-
-def game_status(controller: str) -> str:
-    status = request_json(controller, "/api/state").get("status")
-    return status if isinstance(status, str) else "unknown"
-
-
-def wait_for_status(controller: str, wanted: str, timeout: float) -> bool:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if game_status(controller) == wanted:
-            return True
-        time.sleep(0.5)
-    return False
-
-
-# A person reads the prompt, reads four answers, decides, then presses. Nobody
-# does that in 300 ms, and hammering the badge at machine speed tests a regime
-# the demo never runs in -- far more Activities per round than a round can
-# really produce, and no gap for anything to settle in.
-THINK_SECONDS = (1.8, 6.5)
 
 
 def play_round(
@@ -392,9 +146,17 @@ def run_soak(
     log: Path,
     boot_timeout: float,
 ) -> int:
-    """Play `rounds` rounds and report every fault seen. Returns an exit code."""
+    """Play `rounds` rounds and report every fault. Returns an exit code."""
     rng = random.Random(seed)
-    badges = [BadgePort(path=path, log=log) for path in ports]
+    badges = [
+        BadgePort(
+            path=path,
+            log=log,
+            fault_patterns=FAULT_PATTERNS,
+            silence_is_a_fault=SILENCE_IS_A_FAULT,
+        )
+        for path in ports
+    ]
     # Snapshot the ELF under test. Rebuilding during a soak is normal, and
     # decoding a backtrace against a later binary silently invents symbols.
     elf = log.with_suffix(".elf")
@@ -403,6 +165,7 @@ def run_soak(
         raise RuntimeError(f"no firmware ELF at {source}; build it first")
     elf.write_bytes(source.read_bytes())
     print(f"decoding against a snapshot of {source} -> {elf}", flush=True)
+
     completed = 0
     try:
         for badge in badges:
@@ -413,25 +176,18 @@ def run_soak(
                     f"{badge.path}: no HIL STATUS. Flash with "
                     "./build-firmware.sh --features hil"
                 )
-        print(
-            f"soak: {', '.join(badge.name for badge in badges)}  seed={seed}",
-            flush=True,
-        )
+        print(f"soak: {', '.join(b.name for b in badges)}  seed={seed}", flush=True)
 
         for index in range(1, rounds + 1):
             for badge in badges:
-                if not badge.await_ready(120.0):
+                if not badge.await_polling(120.0):
                     badge.check_alive()
-                    print(
-                        f"[{badge.name}] never reported polling; continuing anyway",
-                        flush=True,
-                    )
+                    print(f"[{badge.name}] never reported polling", flush=True)
+            wanted = {cast(str, badge.callsign) for badge in badges}
             deadline = time.monotonic() + 90
-            while listed_badges(controller) < {
-                cast(str, badge.callsign) for badge in badges
-            }:
+            while not wanted <= listed_badges(controller):
                 if time.monotonic() > deadline:
-                    print("controller never listed every badge; starting regardless")
+                    print("controller never listed every badge", flush=True)
                     break
                 time.sleep(1.0)
 
@@ -453,9 +209,6 @@ def run_soak(
                 time.sleep(1.0)
                 for badge in badges:
                     badge.check_alive()
-            for badge in badges:
-                if badge.faults:
-                    print(f"  {badge.name}: {len(badge.faults)} fault(s) so far")
     finally:
         for badge in badges:
             badge.close()
@@ -481,13 +234,6 @@ def run_soak(
         for line in fault.decoded:
             print(f"  > {line}")
     return 1
-
-
-def discover_ports(explicit: list[str]) -> list[str]:
-    ports = explicit or sorted(glob("/dev/cu.usbmodem*"))
-    if len(ports) != len(set(ports)) or not ports:
-        raise RuntimeError(f"expected distinct badge ports, found {ports}")
-    return ports
 
 
 def main() -> None:
