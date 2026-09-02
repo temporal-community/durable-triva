@@ -1,3 +1,8 @@
+// `set_alloc_error_hook` is unstable. This crate already requires nightly for
+// `build-std`, and an allocation failure that reports nothing is what has made
+// the badge's intermittent abort so hard to place.
+#![feature(alloc_error_hook)]
+
 mod display;
 mod haptics;
 #[cfg(feature = "hil")]
@@ -689,6 +694,7 @@ fn main() -> Result<()> {
     esp_idf_svc::sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
     install_panic_reporter();
+    install_allocation_reporter();
     // A build with no credentials in it will never work, so say so once and
     // stop rather than rebooting forever over it.
     validate_config()?;
@@ -800,6 +806,21 @@ async fn run_worker(ui: Ui, identity: BadgeIdentity, session: Arc<SessionStore>)
     let options = ConnectionOptions::new(Url::from_str(&target)?)
         .api_key(TEMPORAL_API_KEY)
         .tls_options(TlsOptions::builder().server_cert_verifier(verifier).build())
+        // Off, and this is the badge's most important line of configuration.
+        //
+        // It defaults to on, which spawns a task that re-resolves DNS every
+        // thirty seconds through `tokio::spawn_blocking`. Each cycle wants an
+        // OS thread, a FreeRTOS task stack has to come from internal DRAM, and
+        // this chip runs with single-digit kilobytes of it free once TLS is
+        // up. When the spawn eventually fails, tokio panics rather than
+        // returning an error, and the badge aborts and reboots -- mid-round,
+        // at idle, on both boards, roughly on that thirty-second cadence.
+        // Every earlier theory (stack overflow, thread leak, allocation
+        // failure) was chasing the symptom of this.
+        //
+        // A badge holds one connection to one endpoint, so spreading requests
+        // over every resolved address buys it nothing to begin with.
+        .dns_load_balancing(None)
         .build();
     let connection = Connection::connect(options).await?;
     let client = Client::new(connection, ClientOptions::new(TEMPORAL_NAMESPACE).build())?;
@@ -959,6 +980,16 @@ fn free_heap() -> u32 {
     }
 }
 
+/// Free heap of any kind, PSRAM included.
+///
+/// Only useful next to [`free_heap`]: the pair says which pool ran out. This
+/// one read 8.2 MB at an abort caused by internal exhaustion, which is exactly
+/// how long that abort went unexplained.
+fn total_free_heap() -> u32 {
+    // SAFETY: a plain read of an ESP-IDF counter, no arguments, no state.
+    unsafe { esp_idf_svc::sys::esp_get_free_heap_size() }
+}
+
 /// Smallest free internal heap seen since boot, where a slow leak shows up.
 fn lowest_heap() -> u32 {
     // SAFETY: as above.
@@ -973,6 +1004,36 @@ fn unix_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+/// Reports the allocation that could not be served, then lets the default
+/// hook abort as usual.
+///
+/// Rust's allocation failure path does not go through the panic hook, which is
+/// why installing a panic reporter never caught this badge's abort: there was
+/// never a panic. What there is, is a `BREAK` with no message at all.
+///
+/// Nothing in here allocates. `log::error!` formats through an allocating
+/// path, and asking for memory inside the handler for "there is no memory"
+/// either fails again or reports a lie. `esp_rom_printf` writes straight to
+/// the UART from ROM.
+fn install_allocation_reporter() {
+    std::alloc::set_alloc_error_hook(|layout| {
+        // SAFETY: a variadic ROM printf against a NUL-terminated literal and
+        // four integers, matching its conversions. It allocates nothing and
+        // touches no state this handler could have corrupted.
+        unsafe {
+            esp_idf_svc::sys::esp_rom_printf(
+                c"ALLOC FAILED size=%u align=%u internal_free=%u internal_low=%u total_free=%u\n"
+                    .as_ptr(),
+                layout.size() as u32,
+                layout.align() as u32,
+                free_heap(),
+                lowest_heap(),
+                total_free_heap(),
+            );
+        }
+    });
 }
 
 /// Reports a Rust panic before the process aborts.
