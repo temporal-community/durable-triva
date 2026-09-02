@@ -767,22 +767,6 @@ fn boot() -> Result<()> {
     let _eventfs = MountedEventfs::mount(5).context("mount eventfd VFS for Tokio")?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
-        // A current-thread runtime still carries a blocking pool, and its
-        // default ceiling is 512 threads. Every reconnect resolves DNS through
-        // spawn_blocking, so a badge on a flaky link accumulates threads --
-        // and a FreeRTOS task stack has to come from internal DRAM, of which
-        // this chip has about 512 KiB no matter how much PSRAM is fitted.
-        // Exhausting it makes newlib's lock_init_generic fail to allocate a
-        // semaphore and abort().
-        //
-        // Bounded, not starved. Two was tried and is too few: DNS and the
-        // SDK's own blocking work could not both get a thread, so the Cloud
-        // connection never finished establishing and the badge never reached
-        // `Polling trivia queue` at all. Four costs at most 32 KiB and leaves
-        // room for both.
-        .max_blocking_threads(4)
-        // Keep those two rather than paying to recreate them every reconnect.
-        .thread_keep_alive(Duration::from_secs(600))
         .build()
         .context("build single-thread Tokio runtime")?;
     // Anything that reaches here is a badge that has stopped working, so a
