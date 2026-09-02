@@ -41,8 +41,9 @@ pub fn start(
         .name("usb-hil".to_owned())
         // Formatting a log line through esp_log costs more than the 3 KiB
         // ESP-IDF gives a pthread by default, and a stack overflow here is a
-        // reboot in the middle of an acceptance run.
-        .stack_size(12 * 1024)
+        // reboot in the middle of an acceptance run. Measured use is about
+        // 2.8 KiB, so 8 KiB is generous and 4 KiB of internal DRAM cheaper.
+        .stack_size(8 * 1024)
         .spawn(move || {
             read_commands(
                 input,

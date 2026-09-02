@@ -4,18 +4,19 @@ CONFIG_SPIRAM=y
 CONFIG_SPIRAM_MODE_OCT=y
 CONFIG_SPIRAM_SPEED_80M=y
 CONFIG_SPIRAM_USE_MALLOC=y
-# Let small allocations live in PSRAM.
+# Deliberately left at the 16384 default.
 #
-# The default keeps every allocation below 16 KiB in internal DRAM, and Rust,
-# tokio and rustls make thousands of small ones. Measured on a badge: 231 KiB
-# of internal DRAM free at boot, ~12 KiB by the first question, and a
-# low-water mark of 2,459 bytes across a soak -- while `esp_get_free_heap_size`
-# reported 8.2 MB free, because it counts the PSRAM nothing was being put in.
-# Operating that close to the edge is what makes newlib's lock_init_generic
-# fail to allocate a semaphore and abort(), and no amount of tuning task
-# stacks fixes it; raising them made it worse.
-CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096
-CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+# Lowering it to 4096 to move small allocations into PSRAM looked like the fix
+# for internal DRAM exhaustion, and it did improve the low-water mark from
+# 2,459 bytes to 17,343. It also put task stacks in PSRAM: pthread allocates a
+# thread's stack with malloc, so the UI thread's 16 KiB and the HIL reader's
+# 12 KiB both landed above the threshold and went external. A FreeRTOS stack
+# has to be internal -- a task running on one in PSRAM faults when an
+# interrupt touches it during a cache flush -- and a badge duly died with its
+# stack pointer at 0x3c811e50.
+#
+# The memory comes from oversized stacks instead, which measurement can
+# justify and which cannot move anything external.
 # The main task's own high-water mark says it uses about 25 KiB, so 64 KiB was
 # 40 KiB of internal DRAM held in reserve for nothing on the chip that has
 # least of it. 48 KiB keeps a wide margin and gives 16 KiB back.

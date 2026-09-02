@@ -268,9 +268,11 @@ pub fn start(
     };
     thread::Builder::new()
         .name("badge-ui".to_owned())
-        // Drawing formats several strings, and a panic unwinding through here
-        // needs room to report itself before the handler runs.
-        .stack_size(16 * 1024)
+        // Sized from this thread's own high-water mark, which has never gone
+        // below 11.7 KiB free of 16: it uses about 4 KiB. Every task stack is
+        // internal DRAM, the scarcest memory on this chip, so 8 KiB keeps a
+        // wide margin for a panic unwinding through here and gives 8 back.
+        .stack_size(8 * 1024)
         .spawn(move || {
             let mut state = UiThread {
                 display,
