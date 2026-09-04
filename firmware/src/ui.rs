@@ -339,6 +339,9 @@ impl UiThread {
                 }
             }
             self.motor.advance(&mut self.haptics, now);
+            if let Err(error) = self.display.advance_feedback(now) {
+                log::error!("advance LED feedback: {error:#}");
+            }
             self.expire_overlay(now);
             let buttons = self.sample();
             self.advance_buttons(buttons, now);
@@ -475,7 +478,7 @@ impl UiThread {
             } => {
                 self.screen = Screen::Idle;
                 self.draw(move |screen, callsign, _| {
-                    screen.show_feedback(callsign, correct, score_delta)
+                    screen.show_feedback(callsign, correct, score_delta, now)
                 });
                 self.motor.play(
                     if correct {

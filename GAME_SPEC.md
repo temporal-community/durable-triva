@@ -43,6 +43,10 @@
   the Activity may overwrite a live question. The other two test that ownership
   while holding the display lock, so a question drawn in the gap between a
   check and a draw is never erased by a screen that no longer applies.
+- Correct and wrong feedback also uses the 8x8 LED matrix. A correct answer
+  flashes a checkmark twice; a wrong answer flashes an X twice. Both animations
+  finish inside the existing 1.1-second OLED feedback hold and clear before the
+  badge returns to its waiting screen.
 - A badge draws an assigned question before sending best-effort assignment
   telemetry. Game Signals have a 750 ms UI-path ceiling, so a slow Cloud round
   trip cannot leave the screen looking frozen. Between Activities the OLED

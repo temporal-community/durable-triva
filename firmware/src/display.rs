@@ -1,19 +1,25 @@
 //! I2C transport for the badge OLED.
 //!
 //! Every screen is composed by the `badge-screen` crate, which has no ESP-IDF
-//! dependency and is unit tested and previewed on a development host. This file
-//! owns the panel and nothing else.
+//! dependency and is unit tested and previewed on a development host. The
+//! display owns the shared I2C bus and the small LED-matrix result renderer so
+//! one UI thread remains the only writer to either physical display.
+
+use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use badge_screen::{Canvas, Status, WIDTH};
 use esp_idf_svc::hal::{
     delay::TickType,
-    gpio::{Gpio4, Gpio5},
+    gpio::{Gpio4, Gpio5, Gpio9},
     i2c::{I2C0, I2cConfig, I2cDriver},
     units::KiloHertz,
 };
 
-use crate::model::{ChaosCommand, GameSnapshot, Question};
+use crate::{
+    matrix::LedMatrix,
+    model::{ChaosCommand, GameSnapshot, Question},
+};
 
 const ADDRESS: u8 = 0x3c;
 /// Every OLED write is bounded rather than waiting forever.
@@ -31,19 +37,30 @@ const FRAME_CHUNK: usize = 16;
 pub struct BadgeDisplay {
     i2c: I2cDriver<'static>,
     canvas: Canvas,
+    matrix: Option<LedMatrix>,
 }
 
 impl BadgeDisplay {
-    pub fn new(i2c: I2C0<'static>, sda: Gpio4<'static>, scl: Gpio5<'static>) -> Result<Self> {
+    pub fn new(
+        i2c: I2C0<'static>,
+        sda: Gpio4<'static>,
+        scl: Gpio5<'static>,
+        matrix_enable: Gpio9<'static>,
+    ) -> Result<Self> {
         let config = I2cConfig::new().baudrate(KiloHertz(400).into());
         let mut display = Self {
             i2c: I2cDriver::new(i2c, sda, scl, &config).context("initialize OLED I2C")?,
             canvas: Canvas::new(),
+            matrix: None,
         };
         display.command(&[
             0xae, 0xd5, 0x80, 0xa8, 0x3f, 0xd3, 0x00, 0x40, 0x8d, 0x14, 0x20, 0x00, 0xa1, 0xc8,
             0xda, 0x12, 0x81, 0x50, 0xd9, 0xf1, 0xdb, 0x40, 0xa4, 0xa6, 0xaf,
         ])?;
+        match LedMatrix::new(matrix_enable, &mut display.i2c) {
+            Ok(matrix) => display.matrix = Some(matrix),
+            Err(error) => log::error!("LED matrix unavailable; continuing with OLED: {error:#}"),
+        }
         Ok(display)
     }
 
@@ -79,9 +96,26 @@ impl BadgeDisplay {
 
     /// `score_delta` is the value Temporal will record, so the badge agrees with
     /// the board while double points is active.
-    pub fn show_feedback(&mut self, callsign: &str, correct: bool, score_delta: i32) -> Result<()> {
+    pub fn show_feedback(
+        &mut self,
+        callsign: &str,
+        correct: bool,
+        score_delta: i32,
+        now: Instant,
+    ) -> Result<()> {
         self.canvas.feedback(callsign, correct, score_delta);
-        self.flush()
+        self.flush()?;
+        if let Some(matrix) = &mut self.matrix {
+            matrix.start_feedback(&mut self.i2c, correct, now)?;
+        }
+        Ok(())
+    }
+
+    pub fn advance_feedback(&mut self, now: Instant) -> Result<()> {
+        if let Some(matrix) = &mut self.matrix {
+            matrix.advance(&mut self.i2c, now)?;
+        }
+        Ok(())
     }
 
     pub fn show_panic(&mut self, callsign: &str) -> Result<()> {
@@ -105,6 +139,9 @@ impl BadgeDisplay {
     }
 
     pub fn power_off(&mut self) -> Result<()> {
+        if let Some(matrix) = &mut self.matrix {
+            matrix.clear(&mut self.i2c)?;
+        }
         self.canvas.clear();
         self.flush()?;
         self.command(&[0xae])

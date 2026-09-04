@@ -1255,3 +1255,71 @@
 - Not validated, and still needing hands: button answering on the shipped
   image (the demo image deliberately has no inject path, so scored answers
   need real fingers), optical OLED inspection, haptic feel, and sleep/wake.
+
+## 2026-09-03 — Matrix answer feedback for the RustConf demo
+
+- Added a deliberately small IS31FL3731 driver to the standalone Rust badge
+  firmware. It owns only frame zero, uses the existing shared 400 kHz I2C bus,
+  and renders the production badge's flipped 8x8 orientation.
+- Correct answers render a checkmark and wrong answers render an X. Each icon
+  is on for 250 ms, off for 150 ms, on for another 250 ms, then cleared at
+  650 ms. The animation advances from the existing 5 ms UI tick and finishes
+  inside the existing 1.1-second OLED result hold.
+- Matrix initialization is best-effort: a missing or failed matrix logs the
+  error while the OLED and Temporal Worker continue. Every I2C write retains a
+  50 ms ceiling.
+- `cargo fmt --all -- --check`, `./check-host.sh`, and `git diff --check`
+  passed. The host gate ran 77 tests with zero failures. A clean ESP32-S3
+  release build completed in 4m12s, embedded version `1ceb616-dirty`, and
+  verified that the distributable image has no HIL answer-injection protocol.
+- `esptool elf2image` produced an 8,438,912-byte pre-1.0 application image,
+  57.49% of the 14,680,064-byte app slot. Optical matrix orientation,
+  brightness, both flashes, and the final 1.0 image size remain physical and
+  release-night validation gates; no badge was flashed in this session.
+
+## 2026-09-03 — Two-badge matrix HIL run
+
+- Connected `/dev/cu.usbmodem1132401` (`KEEN-RAVEN-C8`) and
+  `/dev/cu.usbmodem1133401` (`KEEN-SEAL-70`). A stale shared ESP-IDF checkout
+  was missing `esp32s3.peripherals.ld`; replaced it with a clean project-local
+  `.embuild`, rebuilt the HIL image in 5m11s, and verified the test-only HIL
+  protocol was embedded.
+- Fully flashed both revision-0.2 ESP32-S3 badges with the 8,443,008-byte HIL
+  image using the explicit 16 MB layout and no-skip writes. Both answered
+  `HIL STATUS`, polled Temporal, and reported 9,860 bytes of HIL-thread stack
+  headroom immediately after flashing.
+- The first round crashed Raven with a double exception immediately after its
+  first question was prepared, before any answer or matrix-feedback path ran.
+  The backtrace was corrupted; `addr2line` resolved the captured PC only to
+  ESP-IDF's `_UserExceptionVector` / `_DoubleExceptionVector`. Raven rebooted,
+  passed PSRAM, Wi-Fi, and Temporal polling, then accepted another question.
+- A replacement round recorded correct answers from both badges. Raven's
+  `HIL ANSWER CORRECT` selected answer 0 for `temporal-011`; Temporal recorded
+  `KEEN-RAVEN-C8 answered correctly (+1)`. Seal's first explicit answer also
+  happened to be correct. No matrix I2C error was logged during either result.
+- A final round sent `HIL ANSWER 1` for Seal's `math-add-084` question
+  (`What is 19 + 10?`). Temporal recorded `KEEN-SEAL-70 answered wrong (-1)`,
+  exercising the X path with no matrix I2C error or reboot.
+- Serial and durable Workflow state prove both correct/wrong result paths ran,
+  but not what the LEDs looked like. Human confirmation of the checkmark/X
+  shapes, orientation, brightness, and two-flash timing remains the final
+  optical acceptance gate. Both badges currently contain the non-shippable
+  HIL image; the controller and serial monitors were stopped.
+
+## 2026-09-03 — Matrix optical acceptance and human image recovery
+
+- Repeated the two-badge run as Workflow
+  `trivia-5a065f9dd59a481895e0d8f328ed1929`. Durable state recorded correct
+  answers for `KEEN-RAVEN-C8` and wrong answers for `KEEN-SEAL-70`; neither
+  badge logged a matrix I2C error or reboot during the feedback paths.
+- Human observation confirmed that the matrix checkmark and X were correctly
+  oriented, bright enough, and each flashed twice. This closes the remaining
+  optical acceptance gate for the answer-feedback feature.
+- Rebuilt without `--features hil`. The build embedded version
+  `1ceb616-dirty`, produced an 8,428,240-byte application (57.41% of the
+  14,680,064-byte slot), and the binary gate printed `verified no HIL test
+  protocol in the image`.
+- Fully flashed that normal image to Raven and Seal using the explicit 16 MiB
+  partition layout and no-skip writes. Both badges rebooted and logged
+  `Polling trivia queue temporal-trivia-badges-v1` under their expected
+  callsigns. They are back on human button input rather than the USB HIL image.

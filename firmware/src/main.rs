@@ -8,6 +8,7 @@ mod haptics;
 #[cfg(feature = "hil")]
 mod hil;
 mod identity;
+mod matrix;
 mod model;
 mod power;
 mod session;
@@ -733,6 +734,7 @@ fn boot() -> Result<()> {
         peripherals.i2c0,
         peripherals.pins.gpio4,
         peripherals.pins.gpio5,
+        peripherals.pins.gpio9,
     )?;
     let haptic_timer = LedcTimerDriver::new(
         peripherals.ledc.timer0,
