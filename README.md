@@ -154,5 +154,5 @@ and [web guide](web/README.md).
   previews.
 - `badge-input/` — hardware-independent button gesture state machine.
 
-Both the controller and firmware use Temporal Rust SDK `0.7.0`. See the
+Both the controller and firmware use Temporal Rust SDK `1.0.0`. See the
 component guides for build and test commands.

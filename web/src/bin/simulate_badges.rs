@@ -18,9 +18,11 @@ use temporalio_sdk::{
     Runtime, SyncWorkflowContext, Worker, WorkerOptions, WorkflowContext, WorkflowContextView,
     WorkflowResult,
     activities::{ActivityContext, ActivityError},
-    runtime::RuntimeOptions,
+    runtime::{
+        RuntimeOptions,
+        worker_tuner::{FixedSizeSlotSupplier, TunerHolder},
+    },
 };
-use temporalio_sdk_core::{ActivitySlotKind, FixedSizeSlotSupplier, TunerBuilder};
 
 const MAX_BADGE_INDEX: usize = 100;
 
@@ -115,7 +117,7 @@ impl SimulatedBadge {
 async fn main() -> Result<()> {
     let index = parse_badge_index()?;
     let client = connect_cloud().await?;
-    let runtime = Runtime::new_assume_tokio(
+    let runtime = Runtime::from_current_tokio(
         RuntimeOptions::builder()
             .heartbeat_interval(Some(Duration::from_secs(10)))
             .build()
@@ -123,11 +125,15 @@ async fn main() -> Result<()> {
     )?;
     let callsign = format!("SIM-{index:02}");
     let worker_identity = format!("badge/{callsign}");
-    let mut tuner = TunerBuilder::default();
-    tuner.activity_slot_supplier(Arc::new(FixedSizeSlotSupplier::<ActivitySlotKind>::new(1)));
+    let tuner = TunerHolder::builder()
+        .workflow_task_slot_supplier(FixedSizeSlotSupplier::new(100))
+        .activity_task_slot_supplier(FixedSizeSlotSupplier::new(1))
+        .local_activity_task_slot_supplier(FixedSizeSlotSupplier::new(100))
+        .nexus_task_slot_supplier(FixedSizeSlotSupplier::new(100))
+        .build();
     let worker_options = WorkerOptions::new(BADGE_TASK_QUEUE)
         .client_identity_override(worker_identity)
-        .tuner(Arc::new(tuner.build()))
+        .tuner(tuner)
         .deployment_options(WorkerDeploymentOptions::from_build_id(
             "temporal-trivia-simulator-0.1.0".to_owned(),
         ))

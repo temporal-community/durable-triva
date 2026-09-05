@@ -1323,3 +1323,34 @@
   partition layout and no-skip writes. Both badges rebooted and logged
   `Polling trivia queue temporal-trivia-badges-v1` under their expected
   callsigns. They are back on human button input rather than the USB HIL image.
+
+## 2026-09-05 — Temporal Rust SDK 1.0 on four physical badges
+
+- The official crates.io sparse index reported `temporalio-sdk 1.0.0`,
+  published 2026-09-04 at 19:35:54 UTC, and the upstream repository exposed
+  tag `v1.0.0`. The coordinated public crate set is SDK/client/common/macros/
+  workflow 1.0.0 with SDK Core 0.9.0.
+- Replaced the four patched 0.7.0 vendor trees with fresh official releases,
+  then reapplied only compiler-proven ESP-IDF boundaries: move Tokio's
+  desktop-only `process` support behind `ephemeral-server`, use
+  `portable-atomic` for Xtensa's missing `AtomicU64`, avoid desktop hostname
+  and platform detection, and exclude the unused JSON Workflow-history parser
+  that still crashes the Xtensa LLVM backend.
+- Updated first-party code for the 1.0 APIs: `Runtime::from_current_tokio`, the
+  SDK-owned Worker tuner types, client-owned Workflow ID policies, and the
+  now-private `TaskToken` representation. No Workflow command sequence or wire
+  contract changed.
+- The initial unmodified ESP build reproduced the known
+  `signal-hook-registry 1.4.8`/ESP-IDF libc failure. The next attempts exposed
+  missing Xtensa `AtomicU64`, the unchanged JSON-deserializer LLVM selection
+  crash, and the private task-token constructor in that order; each failure
+  directly selected the compatibility change above.
+- Strict host Clippy, formatting, and all 77 host tests passed. The default
+  ESP32-S3 release build passed, verified that no HIL protocol was embedded,
+  and produced an 8,444,688-byte application, 57.52% of the 14,680,064-byte
+  app partition (16,448 bytes larger than the prior 0.7.0 image).
+- Fully flashed the default human-input image to all four connected badges.
+  Canary `KEEN-SEAL-A8` passed the 8 MiB PSRAM test, Wi-Fi, time sync, and
+  Temporal polling. Temporal's live roster then reported all four Workers:
+  `BRAVE-CRAB-30`, `BRAVE-OWL-5C`, `KEEN-BEAR-E0`, and `KEEN-SEAL-A8`.
+  A scored four-badge physical-button round was not run in this session.

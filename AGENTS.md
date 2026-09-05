@@ -17,8 +17,9 @@ Code that looks alike across these is often not duplication. Do not merge a
 firmware helper with a controller helper because the bodies match — their
 runtime, determinism and resource constraints do not.
 
-`firmware/vendor/` is a vendored copy of Temporal Rust SDK 0.7.0. Do not edit
-it; fix our integration instead.
+`firmware/vendor/` is a vendored copy of Temporal Rust SDK 1.0.0 (whose Core
+crate is versioned 0.9.0). Do not edit it except for the documented ESP-IDF
+compatibility gates; fix our integration instead.
 
 ## Commands
 

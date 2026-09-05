@@ -6,7 +6,7 @@ generic ESP32-S3 firmware project. It depends on that badge's 16 MiB flash,
 8 MiB PSRAM, OLED, directional buttons, and GPIO mapping.
 
 The Worker renders questions, reads answers, heartbeats while a player decides,
-stores its stable badge/session state in NVS, and runs Temporal Rust SDK `0.7.0`.
+stores its stable badge/session state in NVS, and runs Temporal Rust SDK `1.0.0`.
 
 Each badge also sends Temporal Worker heartbeats every 10 seconds and registers
 with a readable `badge/CALLSIGN` Worker identity. In Temporal Cloud, filter the

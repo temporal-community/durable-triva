@@ -43,7 +43,7 @@ Revisit only if a round ever becomes open-ended (a session cycling decks all con
 ## 2026-08-26 — Rust review (whole workspace)
 
 **Reviewer:** `rust-code-reviewer` agent, against The Rust Book, the Rust API Guidelines, and clippy.
-**Scope:** all first-party `.rs` in `web/`, `shared/`, `badge-screen/`, `firmware/`, plus every `Cargo.toml`, `build.rs`, `rust-toolchain.toml`, `.cargo/config.toml`. Excluded `firmware/vendor/` (vendored temporalio 0.7.0), `web/static/index.html`, and the Open Trivia DB snapshot.
+**Scope:** all first-party `.rs` in `web/`, `shared/`, `badge-screen/`, `firmware/`, plus every `Cargo.toml`, `build.rs`, `rust-toolchain.toml`, `.cargo/config.toml`. Excluded `firmware/vendor/` (vendored Temporal Rust SDK 1.0.0, Core 0.9.0), `web/static/index.html`, and the Open Trivia DB snapshot.
 
 ### Baseline before any change
 

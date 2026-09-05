@@ -28,12 +28,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use temporalio_client::{
     Client, NamespacedClient, WorkflowDescribeOptions, WorkflowExecuteUpdateOptions,
-    WorkflowExecution, WorkflowHandle, WorkflowListOptions, WorkflowQueryOptions,
-    WorkflowStartOptions, tonic::Request,
+    WorkflowExecution, WorkflowHandle, WorkflowIdConflictPolicy, WorkflowIdReusePolicy,
+    WorkflowListOptions, WorkflowQueryOptions, WorkflowStartOptions, tonic::Request,
 };
-use temporalio_common::protos::temporal::api::enums::v1::{
-    TaskQueueType, WorkflowIdConflictPolicy, WorkflowIdReusePolicy,
-};
+use temporalio_common::protos::temporal::api::enums::v1::TaskQueueType;
 use temporalio_common::protos::temporal::api::{
     taskqueue::v1::TaskQueue, workflowservice::v1::DescribeTaskQueueRequest,
 };
@@ -158,7 +156,7 @@ impl IntoResponse for ApiError {
 #[tokio::main]
 async fn main() -> Result<()> {
     let client = connect_cloud().await?;
-    let runtime = Runtime::new_assume_tokio(
+    let runtime = Runtime::from_current_tokio(
         RuntimeOptions::builder()
             .telemetry_options(TelemetryOptions::builder().build())
             .build()

@@ -16,7 +16,7 @@ codegen-units = 16
 opt-level = 0
 
 [patch.crates-io]
-temporalio-client = { path = "firmware/vendor/temporalio-client-0.7.0" }
-temporalio-common = { path = "firmware/vendor/temporalio-common-0.7.0" }
-temporalio-sdk = { path = "firmware/vendor/temporalio-sdk-0.7.0" }
-temporalio-sdk-core = { path = "firmware/vendor/temporalio-sdk-core-0.7.0" }
+temporalio-client = { path = "firmware/vendor/temporalio-client-1.0.0" }
+temporalio-common = { path = "firmware/vendor/temporalio-common-1.0.0" }
+temporalio-sdk = { path = "firmware/vendor/temporalio-sdk-1.0.0" }
+temporalio-sdk-core = { path = "firmware/vendor/temporalio-sdk-core-0.9.0" }

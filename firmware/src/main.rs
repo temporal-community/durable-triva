@@ -42,15 +42,18 @@ use temporalio_client::{
     ActivityIdentifier, Client, ClientOptions, Connection, ConnectionOptions, RpcOptions,
     TlsOptions, WorkflowQueryOptions, WorkflowSignalOptions, errors::AsyncActivityError,
 };
-use temporalio_common::{protos::TaskToken, worker::WorkerDeploymentOptions};
+use temporalio_common::worker::WorkerDeploymentOptions;
 use temporalio_macros::{activities, workflow, workflow_methods};
 use temporalio_sdk::{
     Runtime, SyncWorkflowContext, Worker, WorkerOptions, WorkflowContext, WorkflowContextView,
     WorkflowResult,
     activities::{ActivityContext, ActivityError},
-    runtime::RuntimeOptions,
+    runtime::{
+        RuntimeOptions,
+        worker_tuner::{FixedSizeSlotSupplier, TunerHolder},
+    },
 };
-use temporalio_sdk_core::{ActivitySlotKind, FixedSizeSlotSupplier, TunerBuilder, Url};
+use temporalio_sdk_core::Url;
 
 use badge_input::Choice;
 use badge_screen::Status;
@@ -522,9 +525,9 @@ impl BadgeActivities {
         // reassigns the question to another badge.
         let handle = ctx
             .client()
-            .get_async_activity_handle(ActivityIdentifier::from_task_token(TaskToken(
-                ctx.info().task_token.clone(),
-            )));
+            .get_async_activity_handle(ActivityIdentifier::from_task_token(
+                ctx.info().task_token.clone().into(),
+            ));
         let response = match handle.heartbeat(Some(()), RpcOptions::default()).await {
             Ok(response) => response,
             // Definitive, not transient: the Activity has completed, been
@@ -801,7 +804,7 @@ async fn run_worker(ui: Ui, identity: BadgeIdentity, session: Arc<SessionStore>)
         .heartbeat_interval(Some(WORKER_HEARTBEAT_INTERVAL))
         .build()
         .map_err(|error| anyhow!(error))?;
-    let sdk_runtime = Runtime::new_assume_tokio(runtime_options)?;
+    let sdk_runtime = Runtime::from_current_tokio(runtime_options)?;
     let target = if TEMPORAL_ADDRESS.contains("://") {
         TEMPORAL_ADDRESS.to_owned()
     } else {
@@ -835,8 +838,12 @@ async fn run_worker(ui: Ui, identity: BadgeIdentity, session: Arc<SessionStore>)
     let client = Client::new(connection, ClientOptions::new(TEMPORAL_NAMESPACE).build())?;
     // A physical badge has one screen and one set of buttons, so it must never
     // execute two question Activities concurrently.
-    let mut tuner = TunerBuilder::default();
-    tuner.activity_slot_supplier(Arc::new(FixedSizeSlotSupplier::<ActivitySlotKind>::new(1)));
+    let tuner = TunerHolder::builder()
+        .workflow_task_slot_supplier(FixedSizeSlotSupplier::new(100))
+        .activity_task_slot_supplier(FixedSizeSlotSupplier::new(1))
+        .local_activity_task_slot_supplier(FixedSizeSlotSupplier::new(100))
+        .nexus_task_slot_supplier(FixedSizeSlotSupplier::new(100))
+        .build();
     let point_value = Arc::new(AtomicI32::new(1));
     #[cfg(feature = "hil")]
     let activity_active = Arc::new(AtomicBool::new(false));
@@ -846,7 +853,7 @@ async fn run_worker(ui: Ui, identity: BadgeIdentity, session: Arc<SessionStore>)
     let worker_options = WorkerOptions::new(BADGE_TASK_QUEUE)
         .client_identity_override(worker_identity.clone())
         .max_heartbeat_throttle_interval(Duration::from_millis(BADGE_HEARTBEAT_INTERVAL_MS))
-        .tuner(Arc::new(tuner.build()))
+        .tuner(tuner)
         .deployment_options(WorkerDeploymentOptions::from_build_id(
             "temporal-trivia-badge-0.1.0".to_owned(),
         ))
