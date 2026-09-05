@@ -1354,3 +1354,21 @@
   Temporal polling. Temporal's live roster then reported all four Workers:
   `BRAVE-CRAB-30`, `BRAVE-OWL-5C`, `KEEN-BEAR-E0`, and `KEEN-SEAL-A8`.
   A scored four-badge physical-button round was not run in this session.
+
+## 2026-09-05 — Second four-badge production flash
+
+- Rebuilt the default human-input firmware from clean commit `05bbb35` after
+  the SDK 1.0 upgrade was committed. The build produced the same 8,444,688-byte
+  application (57.52% of the app partition), embedded version `05bbb35`, and
+  verified that the HIL protocol was absent.
+- The badges arrived in two pairs on the same two USB hub paths. Fully flashed
+  all four with explicit 16 MiB layout and no-skip writes. Their MAC addresses
+  were `14:c1:9f:31:04:c0`, `14:c1:9f:30:ad:84`, `3c:0f:02:c1:f3:80`, and
+  `14:c1:9f:2b:f1:88`.
+- Serial boot validation proved version `05bbb35`, the 8 MiB PSRAM memory test,
+  and Wi-Fi startup on `BRAVE-OTTER-C0`, `COZY-TIGER-84`, and `TINY-OWL-80`.
+  `TINY-OWL-80` also logged Temporal polling. The fourth badge's USB node
+  disappeared before its serial monitor reopened, but Temporal's live roster
+  subsequently reported all four new Workers: `BRAVE-OTTER-C0`,
+  `COZY-TIGER-84`, `TINY-FERRIS-88`, and `TINY-OWL-80`.
+- No scored physical-button round was run on this second set.
